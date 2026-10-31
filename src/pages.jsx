@@ -260,7 +260,6 @@ export function ComingSoon() {
   }
   return (
     <main className="soon">
-      <div className="soon-art" aria-hidden><Tin p={{ tin: ['#fdcd62', '#73c3f5'] }} scene="hero" label={null} ratio="auto" /></div>
       <section className="soon-card">
         <p className="eyebrow">dify.homes</p>
         <h1>Coming soon.</h1>
