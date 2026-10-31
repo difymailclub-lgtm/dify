@@ -5,6 +5,7 @@ import reactHooks from 'eslint-plugin-react-hooks'
 import reactRefresh from 'eslint-plugin-react-refresh'
 
 export default [
+  { files: ['api/**/*.js', 'vite.config.js'], languageOptions: { globals: globals.node } },
   { ignores: ['dist'] },
   {
     files: ['**/*.{js,jsx}'],

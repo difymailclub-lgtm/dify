@@ -7,7 +7,9 @@ import 'swiper/css/navigation'
 import 'swiper/css/pagination'
 import 'swiper/css/effect-coverflow'
 import { Illustration, UI } from './art'
+import { supabase } from './lib/supabase'
 import { BRAND, nav, collections, inCollection, bySlug, products, makeLine, totals, money, settings } from './data'
+export { supabase }
 
 /* ---------- Placeholder imagery (watermarked) ---------- */
 export function Tin({ p, label = p?.name, ratio = '1 / 1', round, scene }) {
@@ -18,6 +20,19 @@ export function Tin({ p, label = p?.name, ratio = '1 / 1', round, scene }) {
       <span className="ph-wm">SAMPLE</span>
     </div>
   )
+}
+
+/* ---------- Auth ---------- */
+const AuthCtx = createContext({ session: undefined })
+export const useAuth = () => useContext(AuthCtx)
+export function AuthProvider({ children }) {
+  const [session, setSession] = useState(undefined)
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session))
+    const { data } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
+    return () => data.subscription.unsubscribe()
+  }, [])
+  return <AuthCtx.Provider value={{ session, user: session?.user || null, signOut: () => supabase.auth.signOut() }}>{children}</AuthCtx.Provider>
 }
 
 /* ---------- Cart ---------- */
@@ -43,7 +58,7 @@ export function CartProvider({ children }) {
   const addSlug = (slug, q = 1) => add(makeLine(bySlug(slug)), q)
   const clear = () => { setLines([]); setNote(''); setCode(''); setBuyNow(null) }
   const count = lines.reduce((a, l) => a + l.q, 0)
-  const t = totals(lines, code)
+  const t = totals(lines)
   return <CartCtx.Provider value={{ lines, add, addSlug, setQty, count, ...t, open, setOpen, note, setNote, code, setCode, buyNow, setBuyNow, clear }}>{children}</CartCtx.Provider>
 }
 
@@ -129,7 +144,7 @@ function CartDrawer() {
           {noteOn && <textarea value={note} onChange={(e) => setNote(e.target.value)} maxLength={250} placeholder="Your gift message (250 characters)" aria-label="Gift note" />}
           {savings > 0 && <div className="row save"><span>You're saving</span><b>{money(savings)}</b></div>}
           <div className="row"><span>Subtotal</span><b>{money(subtotal)}</b></div>
-          <PayIn4 total={subtotal} />
+          <p className="fine left">Pay by bank transfer or cash on delivery.</p>
           <button className="btn full" disabled={!lines.length} onClick={() => { close(); navigate('/checkout') }}>Checkout · {money(subtotal)}</button>
           <Link className="view-cart" to="/cart" onClick={close}>View full cart</Link>
         </div>
@@ -137,6 +152,17 @@ function CartDrawer() {
     </>
   )
 }
+
+export async function api(path, body, { method } = {}) {
+  const { data } = await supabase.auth.getSession()
+  const headers = { 'content-type': 'application/json' }
+  if (data.session) headers.authorization = `Bearer ${data.session.access_token}`
+  const r = await fetch(`/api/${path}`, { method: method || (body ? 'POST' : 'GET'), headers, body: body ? JSON.stringify(body) : undefined })
+  const out = await r.json().catch(() => ({}))
+  if (!r.ok) throw new Error(out.error || `Request failed (${r.status})`)
+  return out
+}
+export const subscribeEmail = (email, source) => api('subscribe', { email, source })
 
 /* ---------- Layout ---------- */
 
@@ -201,9 +227,9 @@ function EmailPopup() {
         <div>
           <span className="eyebrow">Unlock</span>
           <h2 id="popup-h">10% off your first order</h2>
-          {done ? <p>Use code <b>WELCOME10</b> at checkout. Welcome aboard!</p> : (
-            <form onSubmit={(e) => { e.preventDefault(); setDone(true); save('popup-seen', true) }}>
-              <input type="email" required placeholder="Email address" aria-label="Email address" autoFocus />
+          {done ? <p>Use code <b>WELCOME10</b> on your first order — create an account at checkout to apply it.</p> : (
+            <form onSubmit={(e) => { e.preventDefault(); const f = e.currentTarget; subscribeEmail(f.email.value, 'popup').then(() => { setDone(true); save('popup-seen', true) }).catch((er) => alert(er.message)) }}>
+              <input name="email" type="email" required placeholder="Email address" aria-label="Email address" autoFocus />
               <button className="btn full">Get My Code</button>
               <button type="button" className="link small" onClick={close}>No thanks, I'll pay full price</button>
             </form>
@@ -229,7 +255,7 @@ export const Icon = {
 
 function Logo() {
   return (
-    <Link to="/" className="logo" aria-label={`${BRAND} home`}>
+    <Link to="/home" className="logo" aria-label={`${BRAND} home`}>
       <svg viewBox="0 0 64 64" className="emblem" aria-hidden>
         <circle cx="32" cy="32" r="30" fill="#f04a49" stroke="#010101" strokeWidth="2" />
         <circle cx="32" cy="32" r="22" fill="#fdcd62" stroke="#010101" strokeWidth="1.5" />
@@ -243,9 +269,11 @@ function Logo() {
 
 function Header() {
   const { count, setOpen } = useCart()
+  const { user } = useAuth()
   const [menu, setMenu] = useState(false)
   const loc = useLocation()
   const [hidden, setHidden] = useState(false)
+  const initial = user ? (user.user_metadata?.full_name || user.email || '?').trim()[0].toUpperCase() : null
   const [rowHidden, setRowHidden] = useState(false)
   useEffect(() => { setMenu(false) }, [loc.pathname])
   useEffect(() => {
@@ -291,7 +319,7 @@ function Header() {
         </nav>
         <div className="icons">
           <Link to="/collections/all" className="ico d-only" aria-label="Search"><Icon.search /></Link>
-          <a href="#" className="ico" aria-label="Account" onClick={(e) => e.preventDefault()}><Icon.user /></a>
+          <Link to="/account" className={`ico ${initial ? 'ico-user' : ''}`} aria-label={user ? 'Your account' : 'Sign in or create an account'}>{initial ? <b>{initial}</b> : <Icon.user />}</Link>
           <button className="ico cart-btn" onClick={() => setOpen(true)} aria-label={`Cart, ${count} items`}>
             <Icon.bag />
             {count > 0 && <em>{count}</em>}
@@ -323,9 +351,9 @@ function Footer() {
         <div className="signup-mark"><svg viewBox="0 0 64 64" aria-hidden><circle cx="32" cy="32" r="30" fill="#f04a49" stroke="#010101" strokeWidth="2" /><circle cx="32" cy="32" r="22" fill="#fdcd62" stroke="#010101" strokeWidth="1.5" /><path d="M16 33c6-9 18-10 26-4l7-5v18l-7-5c-8 6-20 5-26-4z" fill="#73c3f5" stroke="#010101" strokeWidth="1.8" /><circle cx="24" cy="31" r="1.8" fill="#010101" /></svg></div>
         <p id="signup-h">Get first dibs on new tins, recipes and limited drops.</p>
         {done ? <p className="thanks" role="status">You're in! Check your inbox.</p> : (
-          <form onSubmit={(e) => { e.preventDefault(); setDone(true) }}>
+          <form onSubmit={(e) => { e.preventDefault(); const f = e.currentTarget; subscribeEmail(f.email.value, 'footer').then(() => setDone(true)).catch((er) => alert(er.message)) }}>
             <label htmlFor="signup-email" className="sr-only">Email address (required)</label>
-            <input id="signup-email" type="email" required placeholder="Your email*" />
+            <input id="signup-email" name="email" type="email" required placeholder="Your email*" />
             <button className="btn">Subscribe</button>
           </form>
         )}
@@ -351,7 +379,7 @@ function Footer() {
 export function Layout({ children }) {
   const { pathname } = useLocation()
   useEffect(() => { window.scrollTo(0, 0) }, [pathname])
-  if (pathname.startsWith('/admin')) return children
+  if (pathname.startsWith('/admin') || pathname === '/') return children // admin + coming-soon page have their own chrome
   if (pathname.startsWith('/checkout')) return <main id="main">{children}</main>
   return (
     <>

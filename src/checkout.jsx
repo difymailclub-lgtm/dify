@@ -1,8 +1,10 @@
-import { useState, useRef, useEffect } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { BRAND, codes, shipping, totals, money, orders, products, commit, bySlug } from './data'
+import { useState, useEffect, useMemo } from 'react'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { BRAND, money, settings } from './data'
+import { useCart, useAuth, api, supabase, CartLine, Upsells, ShipBar, Tin, PageHero } from './components'
+import { AuthForms, PW_HINT, normalizeLocalPhone } from './account'
+import { bySlug } from './data'
 import { UI } from './art'
-import { useCart, CartLine, Upsells, ShipBar, PayIn4, Tin, PageHero } from './components'
 
 /* ================= CART PAGE ================= */
 export function CartPage() {
@@ -13,7 +15,7 @@ export function CartPage() {
   )
   return (
     <>
-      <PageHero title="Your Cart" bg="#fdcd62" />
+      <PageHero title="Your Cart" />
       <section className="sec cart-page">
         <div>
           <ShipBar subtotal={subtotal} />
@@ -24,13 +26,11 @@ export function CartPage() {
         </div>
         <aside className="summary-card">
           <h2>Order Summary</h2>
-          {savings > 0 && <div className="row save"><span>Bundle & subscription savings</span><b>−{money(savings)}</b></div>}
+          {savings > 0 && <div className="row save"><span>Pack savings</span><b>−{money(savings)}</b></div>}
           <div className="row"><span>Subtotal</span><b>{money(subtotal)}</b></div>
-          <p className="fine left">Shipping, taxes and discount codes calculated at checkout.</p>
-          <PayIn4 total={subtotal} />
+          <p className="fine left">Shipping, tax and discount codes are applied at checkout.</p>
           <button className="btn full" onClick={() => navigate('/checkout')}>Checkout</button>
-          <button className="btn full express" onClick={() => navigate('/checkout?express=1')}>Express Pay <UI.bolt className="inl" /> (demo)</button>
-          <ul className="trust"><li><UI.lock /> Secure checkout</li><li><UI.back /> 30-day happiness promise</li><li><UI.truck /> Ships in 2 business days</li></ul>
+          <ul className="trust"><li><UI.card /> Bank transfer or cash on delivery</li><li><UI.back /> 30-day happiness promise</li><li><UI.truck /> Ships in 2 business days</li></ul>
           <Upsells max={3} />
         </aside>
       </section>
@@ -39,61 +39,95 @@ export function CartPage() {
 }
 
 /* ================= CHECKOUT ================= */
-const STEPS = ['Information', 'Shipping', 'Payment']
-const blank = { email: '', news: true, first: '', last: '', address: '', apt: '', city: '', state: '', zip: '', phone: '' }
+const STEPS = ['Details', 'Payment', 'Review']
+const blank = { email: '', name: '', phone: '', line1: '', line2: '', city: '', region: '', postal_code: '', country: 'PK', news: true, whatsapp: true }
+const COUNTRIES = [['PK', 'Pakistan'], ['AE', 'United Arab Emirates'], ['GB', 'United Kingdom'], ['US', 'United States'], ['SA', 'Saudi Arabia'], ['CA', 'Canada'], ['AU', 'Australia']]
+const newKey = () => `ck-${crypto.randomUUID()}`
+const sessionGet = (k) => { try { return sessionStorage.getItem(k) } catch { return null } }
+const sessionSet = (k, v) => { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v) } catch { /* unavailable */ } }
 
 export function Checkout() {
   const cart = useCart()
+  const { user } = useAuth()
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const lines = params.get('buy') && cart.buyNow ? cart.buyNow : cart.lines
-  const [step, setStep] = useState(params.get('express') ? 2 : 0)
-  const [info, setInfo] = useState(blank)
+  const [step, setStep] = useState(0)
+  const [info, setInfo] = useState(() => ({ ...blank, ...(JSON.parse(sessionGet('checkout-info') || 'null') || {}) }))
   const [errors, setErrors] = useState({})
-  const [ship, setShip] = useState('standard')
-  const [pay, setPay] = useState('card')
-  const [code, setCode] = useState(cart.code)
-  const [codeInput, setCodeInput] = useState('')
-  const [codeMsg, setCodeMsg] = useState('')
+  const [method, setMethod] = useState(settings.codOn ? 'cod' : 'bank_transfer')
+  const [code, setCode] = useState(cart.code || '')
+  const [account, setAccount] = useState(false)
+  const [password, setPassword] = useState('')
+  const [placing, setPlacing] = useState(false)
+  const [serverErr, setServerErr] = useState('')
   const [showSummary, setShowSummary] = useState(false)
-  const headRef = useRef()
-  const t = totals(lines, code, ship)
+  // one key per checkout attempt: a double click, retry or refresh returns the same order instead of a second one
+  const key = useMemo(() => { const k = sessionGet('checkout-key') || newKey(); sessionSet('checkout-key', k); return k }, [])
 
-  useEffect(() => { headRef.current?.focus() }, [step])
+  useEffect(() => { sessionSet('checkout-info', JSON.stringify(info)) }, [info])
+  useEffect(() => { if (user && !info.email) setInfo((i) => ({ ...i, email: user.email, name: i.name || user.user_metadata?.full_name || '' })) }, [user]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { // prefill from the saved profile / last order for signed-in customers
+    if (!user) return
+    supabase.from('profiles').select('full_name, phone').eq('id', user.id).maybeSingle().then(({ data }) => data && setInfo((i) => ({ ...i, name: i.name || data.full_name || '', phone: i.phone || data.phone || '' })))
+    supabase.from('orders').select('shipping_address, phone').eq('user_id', user.id).order('created_at', { ascending: false }).limit(1).maybeSingle().then(({ data }) => {
+      if (!data) return
+      const a = data.shipping_address || {}
+      setInfo((i) => ({ ...i, line1: i.line1 || a.line1 || '', line2: i.line2 || a.line2 || '', city: i.city || a.city || '', region: i.region || a.region || '', postal_code: i.postal_code || a.postal_code || '', country: a.country || i.country, phone: i.phone || data.phone || '' }))
+    })
+  }, [user])
+
+  const subtotal = lines.reduce((s, l) => s + l.unit * l.q, 0)
+  const shipCost = subtotal >= settings.freeShip ? 0 : settings.shipFlat
+  const tax = Math.round(subtotal * settings.taxRate * 100) / 100
+  const estimate = subtotal + shipCost + tax
+  const codBlocked = settings.codMax != null && estimate > settings.codMax
   if (!lines.length) return <section className="sec center"><h1>Nothing to check out</h1><Link className="btn" to="/collections/all">Continue Shopping</Link></section>
 
-  const req = { email: 'Enter an email', first: 'Enter a first name', last: 'Enter a last name', address: 'Enter an address', city: 'Enter a city', state: 'Enter a state', zip: 'Enter a ZIP code' }
+  const req = { email: 'Enter your email', name: 'Enter your full name', line1: 'Enter your street address', city: 'Enter your city' }
+  const set = (k) => (e) => setInfo({ ...info, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value })
   const validate = () => {
     const e = {}
-    Object.entries(req).forEach(([k, m]) => { if (!info[k].trim()) e[k] = m })
+    Object.entries(req).forEach(([k, m]) => { if (!String(info[k]).trim()) e[k] = m })
     if (info.email && !/^\S+@\S+\.\S+$/.test(info.email)) e.email = 'Enter a valid email'
-    if (info.zip && !/^\d{5}(-\d{4})?$/.test(info.zip)) e.zip = 'Enter a valid 5-digit ZIP code'
+    if (info.phone.trim() && !normalizeLocalPhone(info.phone)) e.phone = 'Enter a valid phone number, e.g. 0300 1234567'
+    if (method === 'cod' && !info.phone.trim()) e.phone = 'A phone number is required for cash on delivery'
+    if (account && !user && password.length > 0 && !(password.length >= 10 && /[a-z]/.test(password) && /[A-Z]/.test(password) && /\d/.test(password))) e.password = PW_HINT
+    if (account && !user && !password) e.password = 'Choose a password for your new account'
     setErrors(e)
     return !Object.keys(e).length
   }
-  const next = () => {
-    if (step === 0 && !validate()) { setTimeout(() => document.querySelector('.err-summary')?.focus()); return }
-    setStep(step + 1)
+  const next = () => { if (step === 0 && !validate()) { setTimeout(() => document.querySelector('.err-summary')?.focus()); return } setServerErr(''); setStep(step + 1) }
+  const place = async () => {
+    if (placing) return
+    if (!validate()) { setStep(0); return }
+    setPlacing(true); setServerErr('')
+    try {
+      if (account && !user) {
+        const { data, error } = await supabase.auth.signUp({ email: info.email.trim(), password, options: { data: { full_name: info.name.trim() } } })
+        if (error) throw new Error(/already registered/i.test(error.message) ? 'An account with this email already exists. Sign in first, or untick “Create an account”.' : error.message)
+        if (data.user && info.phone.trim()) await supabase.from('profiles').update({ full_name: info.name.trim(), phone: normalizeLocalPhone(info.phone) }).eq('id', data.user.id)
+      }
+      const res = await api('checkout', {
+        key, method, email: info.email.trim(), phone: info.phone.trim() || null, code: code.trim() || null, gift_note: cart.note || null,
+        marketing: !!info.news, whatsapp: !!info.whatsapp && !!info.phone.trim(),
+        address: { name: info.name, line1: info.line1, line2: info.line2, city: info.city, region: info.region, postal_code: info.postal_code, country: info.country },
+        items: lines.map((l) => ({ sku: l.sku, quantity: l.q })),
+      })
+      sessionSet('checkout-key', null)
+      if (lines === cart.lines) cart.clear(); else cart.setBuyNow(null)
+      navigate(res.token ? `/order?t=${encodeURIComponent(res.token)}` : `/order?id=${res.id}`, { replace: true })
+    } catch (e) {
+      setServerErr(e.message)
+      if (/code/i.test(e.message)) setStep(1)
+    } finally { setPlacing(false) }
   }
-  const applyCode = (e) => {
-    e.preventDefault()
-    const k = codeInput.trim().toUpperCase()
-    if (codes[k]?.active) { setCode(k); cart.setCode(k); setCodeMsg(`${k} applied: ${codes[k].label}`) } else setCodeMsg('That code is not valid.')
-  }
-  const place = () => {
-    if (step === 2 && !info.email) { setStep(0); return }
-    const id = `${1000 + orders.length + 1}`
-    orders.push({ id, date: new Date().toISOString(), customer: info, lines, ship, pay, code: code || null, note: cart.note, ...t, status: 'Paid', fulfillment: 'Unfulfilled', notes: [] })
-    lines.forEach((l) => { const p = products.find((x) => x.slug === l.slug); if (p?.stock != null) p.stock = Math.max(0, p.stock - l.q * l.pack) })
-    if (code && codes[code]) codes[code].uses = (codes[code].uses || 0) + 1
-    commit()
-    if (lines === cart.lines) cart.clear(); else cart.setBuyNow(null)
-    navigate(`/checkout/thank-you/${id}`)
-  }
+
   const field = (k, label, props = {}) => (
     <div className={`field ${props.half ? 'half' : ''}`}>
-      <label htmlFor={`f-${k}`}>{label}{req[k] && <span aria-hidden> *</span>}</label>
-      <input id={`f-${k}`} value={info[k]} onChange={(e) => setInfo({ ...info, [k]: e.target.value })} aria-invalid={!!errors[k]} aria-describedby={errors[k] ? `e-${k}` : undefined} required={!!req[k]} autoComplete={props.ac} type={props.type || 'text'} inputMode={props.im} />
+      <label htmlFor={`f-${k}`}>{label}{(req[k] || (k === 'phone' && method === 'cod')) && <span aria-hidden> *</span>}</label>
+      <input id={`f-${k}`} value={info[k]} onChange={set(k)} aria-invalid={!!errors[k]} aria-describedby={errors[k] ? `e-${k}` : props.hint ? `h-${k}` : undefined} autoComplete={props.ac} type={props.type || 'text'} inputMode={props.im} placeholder={props.ph} />
+      {props.hint && !errors[k] && <small id={`h-${k}`} className="hint">{props.hint}</small>}
       {errors[k] && <p className="err" id={`e-${k}`}>{errors[k]}</p>}
     </div>
   )
@@ -106,96 +140,95 @@ export function Checkout() {
           <span>{money(l.unit * l.q)}</span>
         </div>
       ))}
-      <form className="code" onSubmit={applyCode}>
-        <label htmlFor="code" className="sr-only">Discount code</label>
-        <input id="code" placeholder="Discount code" value={codeInput} onChange={(e) => setCodeInput(e.target.value)} />
-        <button className="btn sm" disabled={!codeInput.trim()}>Apply</button>
-      </form>
-      <p className="code-msg" role="status">{codeMsg}</p>
-      <div className="row"><span>Subtotal</span><span>{money(t.subtotal)}</span></div>
-      {t.discount > 0 && <div className="row save"><span>Discount ({code})</span><span>−{money(t.discount)}</span></div>}
-      <div className="row"><span>Shipping</span><span>{step < 1 ? 'Calculated next step' : t.shipCost ? money(t.shipCost) : 'FREE'}</span></div>
-      <div className="row"><span>Estimated tax</span><span>{money(t.tax)}</span></div>
-      <div className="row total"><span>Total</span><b>USD {money(t.total)}</b></div>
-      {t.savings > 0 && <p className="save-note"><UI.party className="inl" /> You're saving {money(t.savings + t.discount)} on this order</p>}
+      <div className="row"><span>Subtotal</span><span>{money(subtotal)}</span></div>
+      <div className="row"><span>Shipping</span><span>{shipCost ? money(shipCost) : 'FREE'}</span></div>
+      <div className="row"><span>Estimated tax</span><span>{money(tax)}</span></div>
+      {code.trim() && <div className="row save"><span>Code {code.trim().toUpperCase()}</span><span>applied when you place the order</span></div>}
+      <div className="row total"><span>Total</span><b>{settings.currency} {money(estimate)}</b></div>
     </div>
   )
 
   return (
     <div className="checkout">
       <div className="co-main">
-        <Link to="/" className="logo">{BRAND}</Link>
+        <Link to="/home" className="logo"><span>{BRAND}</span></Link>
         <nav className="co-steps" aria-label="Checkout steps">
-          <ol>
-            <li><Link to="/cart">Cart</Link></li>
-            {STEPS.map((s, i) => <li key={s} aria-current={i === step ? 'step' : undefined}>{i < step ? <button onClick={() => setStep(i)}>{s}</button> : <span>{s}</span>}</li>)}
-          </ol>
+          <ol><li><Link to="/cart">Cart</Link></li>{STEPS.map((s, i) => <li key={s} aria-current={i === step ? 'step' : undefined}>{i < step ? <button onClick={() => setStep(i)}>{s}</button> : <span>{s}</span>}</li>)}</ol>
         </nav>
-
-        <button className="co-toggle" onClick={() => setShowSummary(!showSummary)} aria-expanded={showSummary} aria-controls="co-summary-m">
-          {showSummary ? 'Hide' : 'Show'} order summary <b>{money(t.total)}</b>
-        </button>
+        <button className="co-toggle" onClick={() => setShowSummary(!showSummary)} aria-expanded={showSummary} aria-controls="co-summary-m">{showSummary ? 'Hide' : 'Show'} order summary <b>{money(estimate)}</b></button>
         {showSummary && <div id="co-summary-m" className="co-summary mobile">{Summary}</div>}
-
-        <h1 ref={headRef} tabIndex={-1} className="co-h">{STEPS[step]}</h1>
-
-        {step === 0 && (
-          <div className="express-row">
-            <p>Express checkout</p>
-            <div><button className="btn express" onClick={() => setStep(2)}>Express Pay <UI.bolt className="inl" /></button><button className="btn ghost" onClick={() => setStep(2)}>Pay in 4</button></div>
-            <span className="or">OR</span>
-          </div>
-        )}
+        <h1 className="co-h">{STEPS[step]}</h1>
 
         {step === 0 && (
           <form onSubmit={(e) => { e.preventDefault(); next() }} noValidate>
             {!!Object.keys(errors).length && (
-              <div className="err-summary" tabIndex={-1} role="alert">
-                <b>Please fix {Object.keys(errors).length} {Object.keys(errors).length === 1 ? 'field' : 'fields'}:</b>
-                <ul>{Object.entries(errors).map(([k, m]) => <li key={k}><a href={`#f-${k}`}>{m}</a></li>)}</ul>
+              <div className="err-summary" tabIndex={-1} role="alert"><b>Please fix {Object.keys(errors).length} {Object.keys(errors).length === 1 ? 'field' : 'fields'}:</b>
+                <ul>{Object.entries(errors).map(([k, m]) => <li key={k}><a href={`#f-${k}`}>{m}</a></li>)}</ul></div>
+            )}
+            {!user && (
+              <div className="co-signin">
+                <p>Have an account? <button type="button" className="link" onClick={() => setAccount('signin')}>Sign in</button> for faster checkout.</p>
+                {account === 'signin' && <AuthForms compact defaultTab="signin" email={info.email} onDone={() => setAccount(false)} />}
               </div>
             )}
+            {user && <p className="notice">Signed in as <b>{user.email}</b>. <Link to="/account">Not you?</Link></p>}
             <h2>Contact</h2>
             {field('email', 'Email', { type: 'email', ac: 'email' })}
-            <label className="check"><input type="checkbox" checked={info.news} onChange={(e) => setInfo({ ...info, news: e.target.checked })} /> Email me with news and offers</label>
+            {field('phone', 'Phone', { type: 'tel', ac: 'tel', im: 'tel', ph: '0300 1234567', hint: method === 'cod' ? 'Required for cash on delivery so the courier can reach you.' : 'Optional. We’ll only call about this order.' })}
+            {!!info.phone.trim() && <label className="check"><input type="checkbox" checked={info.whatsapp} onChange={set('whatsapp')} /> Send order updates on WhatsApp</label>}
+            <label className="check"><input type="checkbox" checked={info.news} onChange={set('news')} /> Email me about new tins and offers</label>
             <h2>Shipping address</h2>
             <div className="fields">
-              {field('first', 'First name', { half: true, ac: 'given-name' })}
-              {field('last', 'Last name', { half: true, ac: 'family-name' })}
-              {field('address', 'Address', { ac: 'address-line1' })}
-              {field('apt', 'Apartment, suite, etc. (optional)', { ac: 'address-line2' })}
+              {field('name', 'Full name', { ac: 'name' })}
+              {field('line1', 'Street address', { ac: 'address-line1' })}
+              {field('line2', 'Apartment, floor, landmark (optional)', { ac: 'address-line2' })}
               {field('city', 'City', { half: true, ac: 'address-level2' })}
-              {field('state', 'State', { half: true, ac: 'address-level1' })}
-              {field('zip', 'ZIP code', { half: true, ac: 'postal-code', im: 'numeric' })}
-              {field('phone', 'Phone (optional)', { half: true, type: 'tel', ac: 'tel' })}
+              {field('region', 'Province / state', { half: true, ac: 'address-level1' })}
+              {field('postal_code', 'Postal code (optional)', { half: true, ac: 'postal-code' })}
+              <div className="field half"><label htmlFor="f-country">Country</label><select id="f-country" value={info.country} onChange={set('country')} autoComplete="country">{COUNTRIES.map(([c, n]) => <option key={c} value={c}>{n}</option>)}</select></div>
             </div>
-            <div className="co-nav"><Link to="/cart">‹ Return to cart</Link><button className="btn">Continue to shipping</button></div>
+            {!user && (
+              <div className="co-account">
+                <label className="check"><input type="checkbox" checked={account === true} onChange={(e) => setAccount(e.target.checked)} /> <span><b>Create an account</b> <small>— track this order, reorder in one tap, and unlock 10% off your first order with code WELCOME10.</small></span></label>
+                {account === true && (
+                  <div className="field"><label htmlFor="f-password">Choose a password</label>
+                    <input id="f-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" aria-invalid={!!errors.password} aria-describedby="h-password" />
+                    <small id="h-password" className={errors.password ? 'err' : 'hint'}>{errors.password || PW_HINT}</small>
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="co-nav"><Link to="/cart">‹ Return to cart</Link><button className="btn">Continue to payment</button></div>
           </form>
         )}
 
         {step === 1 && (
           <>
             <Review info={info} setStep={setStep} />
-            <fieldset className="radios"><legend><h2>Shipping method</h2></legend>
-              {shipping.map((s) => {
-                const cost = t.free && s.id === 'standard' ? 0 : s.price
-                return <label key={s.id} className={ship === s.id ? 'on' : ''}><input type="radio" name="ship" checked={ship === s.id} onChange={() => setShip(s.id)} /><span>{s.label}</span><b>{cost ? money(cost) : 'FREE'}</b></label>
-              })}
+            <fieldset className="radios"><legend><h2>How would you like to pay?</h2></legend>
+              {settings.codOn && (
+                <label className={`pay-opt ${method === 'cod' ? 'on' : ''} ${codBlocked ? 'off' : ''}`}><input type="radio" name="pay" disabled={codBlocked} checked={method === 'cod'} onChange={() => setMethod('cod')} />
+                  <span><b>Cash on delivery</b><small>{codBlocked ? `Available for orders up to ${money(settings.codMax)}.` : 'Pay the courier in cash. We’ll ask you to confirm the order first.'}</small></span></label>
+              )}
+              {settings.bankOn && (
+                <label className={`pay-opt ${method === 'bank_transfer' ? 'on' : ''}`}><input type="radio" name="pay" checked={method === 'bank_transfer'} onChange={() => setMethod('bank_transfer')} />
+                  <span><b>Bank transfer</b><small>We show you the account details next. Upload a screenshot of the transfer and we confirm it within a few hours.</small></span></label>
+              )}
             </fieldset>
-            <div className="co-nav"><button className="link" onClick={() => setStep(0)}>‹ Return to information</button><button className="btn" onClick={next}>Continue to payment</button></div>
+            {method === 'cod' && !info.phone.trim() && <p className="err">Cash on delivery needs a phone number. <button className="link" onClick={() => setStep(0)}>Add one</button></p>}
+            <div className="field"><label htmlFor="code">Discount code (optional)</label><input id="code" value={code} onChange={(e) => setCode(e.target.value)} placeholder={user ? 'e.g. WELCOME10' : 'First-order codes need an account'} autoCapitalize="characters" /></div>
+            {serverErr && <p className="err" role="alert">{serverErr}</p>}
+            <div className="co-nav"><button className="link" onClick={() => setStep(0)}>‹ Back to details</button><button className="btn" onClick={() => (method === 'cod' && !info.phone.trim() ? setStep(0) : next())}>Review order</button></div>
           </>
         )}
 
         {step === 2 && (
           <>
-            {info.email ? <Review info={info} ship={ship} setStep={setStep} /> : <p className="notice">Express checkout (demo): we'll still need your details. <button className="link" onClick={() => setStep(0)}>Add them →</button></p>}
-            <fieldset className="radios"><legend><h2>Payment</h2></legend>
-              <p className="fine left"><UI.lock className="inl" /> Demo store: no payment details are collected and no charge is made.</p>
-              {[['card', 'Credit card (demo)'], ['pay4', `Pay in 4 — ${money(t.total / 4)} today (demo)`], ['express', 'Express Pay (demo)']].map(([id, l]) => (
-                <label key={id} className={pay === id ? 'on' : ''}><input type="radio" name="pay" checked={pay === id} onChange={() => setPay(id)} /><span>{l}</span></label>
-              ))}
-            </fieldset>
-            <div className="co-nav"><button className="link" onClick={() => setStep(1)}>‹ Return to shipping</button><button className="btn" onClick={place} disabled={!info.email}>Pay now · {money(t.total)}</button></div>
+            <Review info={info} setStep={setStep} method={method} />
+            <div className="co-summary mobile always">{Summary}</div>
+            {serverErr && <p className="err" role="alert">{serverErr}</p>}
+            <p className="fine left">{method === 'cod' ? 'Nothing to pay now. Confirm the order on the next page and pay the courier in cash.' : 'Nothing is charged automatically. You’ll see the bank details on the next page.'}</p>
+            <div className="co-nav"><button className="link" onClick={() => setStep(1)}>‹ Back to payment</button><button className="btn" onClick={place} disabled={placing} aria-busy={placing}>{placing ? 'Placing order…' : `Place order · ${money(estimate)}`}</button></div>
           </>
         )}
         <footer className="co-foot"><Link to="/pages/terms">Terms</Link><Link to="/pages/privacy">Privacy</Link><Link to="/pages/faq">Shipping & returns</Link></footer>
@@ -205,51 +238,13 @@ export function Checkout() {
   )
 }
 
-function Review({ info, ship, setStep }) {
-  const s = shipping.find((x) => x.id === ship)
+function Review({ info, setStep, method }) {
   return (
     <dl className="co-review">
-      <div><dt>Contact</dt><dd>{info.email}</dd><button className="link" onClick={() => setStep(0)}>Change<span className="sr-only"> contact</span></button></div>
-      <div><dt>Ship to</dt><dd>{[info.address, info.apt, info.city, info.state, info.zip].filter(Boolean).join(', ')}</dd><button className="link" onClick={() => setStep(0)}>Change<span className="sr-only"> address</span></button></div>
-      {s && <div><dt>Method</dt><dd>{s.label}</dd><button className="link" onClick={() => setStep(1)}>Change<span className="sr-only"> shipping method</span></button></div>}
+      <div><dt>Contact</dt><dd>{info.email}{info.phone && <> · {info.phone}</>}</dd><button className="link" onClick={() => setStep(0)}>Change<span className="sr-only"> contact</span></button></div>
+      <div><dt>Ship to</dt><dd>{[info.name, info.line1, info.line2, info.city, info.region, info.postal_code].filter(Boolean).join(', ')}</dd><button className="link" onClick={() => setStep(0)}>Change<span className="sr-only"> address</span></button></div>
+      {method && <div><dt>Payment</dt><dd>{method === 'cod' ? 'Cash on delivery' : 'Bank transfer'}</dd><button className="link" onClick={() => setStep(1)}>Change<span className="sr-only"> payment</span></button></div>}
     </dl>
-  )
-}
-
-/* ================= THANK YOU ================= */
-export function ThankYou() {
-  const { id } = useParams()
-  const o = orders.find((x) => x.id === id)
-  if (!o) return <section className="sec center"><h1>Order not found</h1><Link className="btn" to="/">Home</Link></section>
-  return (
-    <div className="checkout thanks-page">
-      <div className="co-main">
-        <Link to="/" className="logo">{BRAND}</Link>
-        <div className="ty-head"><span className="ty-check" aria-hidden><UI.check /></span><div><small>Order #{o.id}</small><h1 tabIndex={-1} ref={(el) => el?.focus()}>Thank you, {o.customer.first || 'friend'}!</h1></div></div>
-        <div className="card-box"><h2>Your order is confirmed</h2><p>We've sent a confirmation to <b>{o.customer.email}</b>. Tins ship in about 2 business days.</p></div>
-        <div className="card-box">
-          <h2>Order details</h2>
-          <dl className="ty-grid">
-            <div><dt>Shipping address</dt><dd>{o.customer.first} {o.customer.last}<br />{o.customer.address}<br />{o.customer.city}, {o.customer.state} {o.customer.zip}</dd></div>
-            <div><dt>Shipping method</dt><dd>{shipping.find((s) => s.id === o.ship)?.label}</dd></div>
-            <div><dt>Payment</dt><dd>{o.pay} (demo) · {money(o.total)}</dd></div>
-            {o.note && <div><dt>Gift note</dt><dd>“{o.note}”</dd></div>}
-          </dl>
-        </div>
-        <div className="card-box refer"><h2>Give 20%, get 20%</h2><p>Share your link and you both save on the next box.</p><button className="btn sm" onClick={() => navigator.clipboard?.writeText(`${location.origin}/?ref=${o.id}`)}>Copy referral link</button></div>
-        <div className="co-nav"><span>Need help? <Link to="/pages/faq">Contact us</Link></span><Link className="btn" to="/collections/all">Continue shopping</Link></div>
-      </div>
-      <aside className="co-summary desktop" aria-label="Order summary">
-        <div className="co-summary-in">
-          {o.lines.map((l) => <div key={l.id} className="co-line"><div className="co-img"><Tin p={bySlug(l.slug)} label={null} /><em>{l.q}</em></div><div><b>{l.name}</b>{l.label && <small>{l.label}</small>}</div><span>{money(l.unit * l.q)}</span></div>)}
-          <div className="row"><span>Subtotal</span><span>{money(o.subtotal)}</span></div>
-          {o.discount > 0 && <div className="row save"><span>Discount</span><span>−{money(o.discount)}</span></div>}
-          <div className="row"><span>Shipping</span><span>{o.shipCost ? money(o.shipCost) : 'FREE'}</span></div>
-          <div className="row"><span>Tax</span><span>{money(o.tax)}</span></div>
-          <div className="row total"><span>Total</span><b>{money(o.total)}</b></div>
-        </div>
-      </aside>
-    </div>
   )
 }
 

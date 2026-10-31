@@ -136,7 +136,7 @@ export function Admin() {
   if (isAdmin === null) return <div className="admin" {...attrs}><p className="ad-center" role="status">Checking access…</p></div>
   if (!isAdmin) return (
     <div className="admin" {...attrs}>
-      <main className="ad-login"><div className="ad-login-card"><h1>No admin access</h1><p className="ad-muted">{session.user.email} is signed in but isn't an admin.</p><button className="ad-btn" onClick={() => supabase.auth.signOut()}>Sign out</button><Link to="/">← Back to store</Link></div></main>
+      <main className="ad-login"><div className="ad-login-card"><h1>No admin access</h1><p className="ad-muted">{session.user.email} is signed in but isn't an admin.</p><button className="ad-btn" onClick={() => supabase.auth.signOut()}>Sign out</button><Link to="/home">← Back to store</Link></div></main>
     </div>
   )
 
@@ -169,7 +169,7 @@ export function Admin() {
           <nav className="ad-side-nav">{nav.map(NavItem)}</nav>
           <div className="ad-side-foot">
             {Prefs}
-            <a className="ad-btn ghost" href="/" target="_blank" rel="noreferrer"><Ic.ext /> View store</a>
+            <a className="ad-btn ghost" href="/home" target="_blank" rel="noreferrer"><Ic.ext /> View store</a>
             <button className="ad-btn ghost" onClick={() => supabase.auth.signOut()}><Ic.logout /> Sign out</button>
           </div>
         </aside>
@@ -199,7 +199,7 @@ export function Admin() {
         <div id="ad-sheet" className={`ad-sheet ${sheet ? 'on' : ''}`} role="dialog" aria-modal="true" aria-label="More" hidden={!sheet}>
           <nav className="ad-sheet-grid">{nav.slice(4).map(NavItem)}</nav>
           {Prefs}
-          <div className="ad-row"><a className="ad-btn" href="/" target="_blank" rel="noreferrer"><Ic.ext /> View store</a><button className="ad-btn" onClick={() => supabase.auth.signOut()}><Ic.logout /> Sign out</button></div>
+          <div className="ad-row"><a className="ad-btn" href="/home" target="_blank" rel="noreferrer"><Ic.ext /> View store</a><button className="ad-btn" onClick={() => supabase.auth.signOut()}><Ic.logout /> Sign out</button></div>
         </div>
         <div className="ad-toast" role="status" aria-live="polite">{toast && <span key={toast.k} className={toast.tone}>{toast.msg}</span>}</div>
         <AskDialog req={dlg} done={closeDlg} />
@@ -288,7 +288,7 @@ function Login() {
         {msg && <p role="status">{msg}</p>}
         <button className="ad-btn primary full" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
         <button type="button" className="ad-link" onClick={reset}>Forgot password?</button>
-        <Link to="/">← Back to store</Link>
+        <Link to="/home">← Back to store</Link>
       </form>
     </main>
   )
@@ -549,7 +549,7 @@ function OrderDetail() {
         </div>
         <aside className="ad-stack">
           <section className="ad-card"><h2>Customer</h2>
-            <p><b>{a.name}</b><br /><a href={`mailto:${o.email}`}>{o.email}</a>{o.phone && <><br />{o.phone}</>}</p>
+            <p><b>{a.name}</b> <span className={`ad-pill ${o.user_id ? 'ok' : ''}`}>{o.user_id ? 'Has account' : 'Guest checkout'}</span><br /><a href={`mailto:${o.email}`}>{o.email}</a>{o.phone && <><br />{o.phone}</>}</p>
             <div className="ad-row">
               {o.phone && <a className="ad-btn" href={`tel:${o.phone}`}><Ic.phone /> Call</a>}
               {phone && <a className="ad-btn" href={`https://wa.me/${phone}?text=${waText}`} target="_blank" rel="noreferrer"><Ic.chat /> WhatsApp</a>}
@@ -810,7 +810,8 @@ function Customers() {
             <div className="ad-cust-stats">
               <span>{c.orders} orders</span><b>{money(c.spent_cents)}</b>
               {c.cod_cancelled > 0 && <span className="ad-pill bad" title="Cancelled cash-on-delivery orders">{c.cod_cancelled} COD cancelled</span>}
-              {c.marketing && <span className="ad-pill ok">Subscribed</span>}
+              <span className={`ad-pill ${c.has_account ? 'ok' : ''}`}>{c.has_account ? 'Account' : 'Guest'}</span>
+              {c.marketing && <span className="ad-pill info">Newsletter</span>}
             </div>
             <div className="ad-row ad-sm"><Link className="ad-link" to={`/admin/orders?f=all&q=${encodeURIComponent(c.email)}`}>View orders</Link><BlockButtons email={c.email} phone={c.phone} /></div>
           </li>

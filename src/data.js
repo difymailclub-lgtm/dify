@@ -101,7 +101,7 @@ export const bundleIncludes = {
   'countdown-calendar': ['hot-smoked-coho', 'coho-black-garlic', 'sardines-orange-fennel', 'albacore-chili-oil', 'mussels-saffron', 'mackerel-peppercorn', 'serving-fork'],
 }
 
-export const boxSizes = [{ n: 6, off: 10 }, { n: 9, off: 15 }, { n: 12, off: 20 }]
+export const boxSizes = [{ n: 6 }, { n: 9 }, { n: 12 }]
 
 export const faqs = [
   { group: 'Orders & Shipping', items: [
@@ -142,46 +142,38 @@ export const nav = [
 export const bySlug = (s) => products.find((p) => p.slug === s)
 export const inCollection = (c) => (c === 'all' ? products.filter((p) => p.price > 0) : products.filter((p) => p.cat.includes(c)))
 
-/* ---------- Commerce rules ---------- */
+/* ---------- Commerce rules (prices, stock and discounts are decided by the database; this is display logic) ---------- */
 export const settings = {
-  freeShip: 75, giftTin: 10, subOff: 0.15, taxRate: 0.08, lowStock: 15, adminPass: 'admin',
-  announcements: ['Free shipping on orders $75+', 'Build a box of 6, 9 or 12 tins and save up to 20%', 'Refer a friend, you both get 20% off', 'Gift notes available at checkout'],
+  currency: 'USD', freeShip: 75, shipFlat: 8.95, taxRate: 0.08, lowStock: 15, bankOn: true, codOn: true, codMax: null,
+  announcements: ['Free shipping on orders $75+', 'Pay by bank transfer or cash on delivery', 'Gift notes available at checkout'],
 }
-export const shipping = [
-  { id: 'standard', label: 'Standard (3–7 business days)', price: 8.95 },
-  { id: 'express', label: 'Express (2 business days)', price: 18.95 },
-  { id: 'overnight', label: 'Overnight', price: 34.95 },
-]
-export const codes = { WELCOME10: { pct: 10, label: '10% off your first order', active: true, uses: 0 }, FISHY15: { pct: 15, label: '15% off sitewide', active: true, uses: 0 }, FREESHIP: { ship: true, label: 'Free shipping', active: true, uses: 0 } }
-export const canGiftTin = (p) => p.cat.includes('bundles') || p.cat.includes('gifts')
-export const canSubscribe = (p) => p.cat.includes('tinned-fish') || p.slug === 'starter-trio'
-export const packsFor = (p) => (p.cat.includes('tinned-fish') ? [1, 3, 6] : [1])
-const packOff = { 1: 1, 3: 0.9, 6: 0.85 }
+export const canGiftTin = (p) => (p.variants || []).some((v) => v.gift_tin)
+export const canSubscribe = () => false // subscriptions are not offered with bank transfer / cash on delivery
+export const packsFor = (p) => [...new Set((p.variants || []).filter((v) => !v.gift_tin).map((v) => v.units))].sort((a, b) => a - b).concat((p.variants || []).length ? [] : [1])
 const r2 = (n) => Math.round(n * 100) / 100
+export const variantFor = (p, { pack = 1, gift = false } = {}) => (p.variants || []).find((v) => v.units === pack && !!v.gift_tin === !!gift) || (p.variants || [])[0]
 
-export function makeLine(p, { pack = 1, gift = false, sub = false } = {}) {
-  const compare = p.price * pack + (gift ? settings.giftTin : 0)
-  const base = p.price * pack * packOff[pack] + (gift ? settings.giftTin : 0)
+export function makeLine(p, { pack = 1, gift = false } = {}) {
+  const v = variantFor(p, { pack, gift })
+  const unit = v ? v.price_cents / 100 : p.price
+  const compare = v?.compare_at_cents ? v.compare_at_cents / 100 : unit
   return {
-    id: [p.slug, pack, +gift, +sub].join('|'), slug: p.slug, name: p.name, pack, gift, sub,
-    unit: r2(sub ? base * (1 - settings.subOff) : base), compare: r2(compare),
-    label: [pack > 1 && `${pack}-Pack`, gift && 'Gift Tin', sub && 'Subscribe & Save · every 4 weeks'].filter(Boolean).join(' · '),
+    id: v ? v.sku : `${p.slug}|${pack}|${+gift}`, sku: v?.sku, slug: p.slug, name: p.name, pack, gift,
+    unit: r2(unit), compare: r2(compare), label: v && v.title !== 'Single' ? v.title : '',
   }
 }
 
-export function totals(lines, code, shipId = 'standard') {
+// Cart estimate. Discount codes and the final total are applied by the server when the order is placed.
+export function totals(lines) {
   const subtotal = r2(lines.reduce((s, l) => s + l.unit * l.q, 0))
-  const savings = r2(lines.reduce((s, l) => s + (l.compare - l.unit) * l.q, 0))
-  const c = codes[code]?.active ? codes[code] : null
-  const discount = r2(c?.pct ? subtotal * c.pct / 100 : 0)
-  const free = subtotal >= settings.freeShip || c?.ship
-  const ship = shipping.find((x) => x.id === shipId) || shipping[0]
-  const shipCost = !lines.length ? 0 : free && ship.id === 'standard' ? 0 : ship.price
-  const tax = r2((subtotal - discount) * settings.taxRate)
-  return { subtotal, savings, discount, shipCost, tax, total: r2(subtotal - discount + shipCost + tax), free }
+  const savings = r2(lines.reduce((s, l) => s + Math.max(0, l.compare - l.unit) * l.q, 0))
+  const free = subtotal >= settings.freeShip
+  const shipCost = !lines.length || free ? 0 : settings.shipFlat
+  const tax = r2(subtotal * settings.taxRate)
+  return { subtotal, savings, discount: 0, shipCost, tax, total: r2(subtotal + shipCost + tax), free }
 }
 
-export const money = (n) => `$${n.toFixed(2)}`
+export const money = (n) => `$${(n ?? 0).toFixed(2)}`
 
 /* ---------- Sample reviews (clearly labeled demo content) ---------- */
 const reviewPool = [
@@ -201,26 +193,41 @@ export function reviewsFor(slug) {
   })
 }
 
-/* ---------- Persistence: localStorage now; swap load/commit for your API later ---------- */
-export const orders = []
-const KEY = 'store-v1'
+/* ---------- Live catalog from Supabase ---------- */
 const listeners = new Set()
 let version = 0
-try {
-  const saved = JSON.parse(localStorage.getItem(KEY))
-  if (saved) {
-    products.splice(0, products.length, ...saved.products)
-    Object.keys(codes).forEach((k) => delete codes[k]); Object.assign(codes, saved.codes)
-    Object.assign(settings, saved.settings)
-    orders.push(...saved.orders)
-  }
-} catch { /* storage unavailable or corrupt: use seed data */ }
-
-export function commit() {
-  try { localStorage.setItem(KEY, JSON.stringify({ products, codes, settings, orders })) } catch { /* storage unavailable */ }
-  version++
-  listeners.forEach((f) => f())
-}
+const bump = () => { version++; listeners.forEach((f) => f()) }
 export const subscribe = (f) => (listeners.add(f), () => listeners.delete(f))
 export const getVersion = () => version
-export function resetStore() { try { localStorage.removeItem(KEY) } catch { /* storage unavailable */ } location.reload() }
+export let catalogReady = false
+
+export async function loadCatalog() {
+  const { supabase } = await import('./lib/supabase')
+  const [p, c, st] = await Promise.all([
+    supabase.from('products').select('id, slug, name, description, status, badge, species, origin, nutrition, art, colors, image_path, stock, sort_order, variants(id, sku, title, units, gift_tin, price_cents, compare_at_cents, sort_order), product_collections(collection)').eq('status', 'active').order('sort_order'),
+    supabase.from('collections').select('handle, title, blurb, color, sort_order').order('sort_order'),
+    supabase.from('settings').select('currency, free_ship_threshold_cents, shipping_flat_cents, tax_rate, low_stock_threshold, announcements, bank_transfer_enabled, cod_enabled, cod_max_total_cents').maybeSingle(),
+  ])
+  if (p.error || !p.data?.length) { console.warn('Catalog unavailable, showing demo data', p.error); return }
+  const rows = p.data.map((r, i) => {
+    const variants = (r.variants || []).sort((a, b) => a.sort_order - b.sort_order)
+    const single = variants.find((v) => v.units === 1 && !v.gift_tin) || variants[0]
+    return {
+      id: r.id, slug: r.slug, name: r.name, desc: r.description, badge: r.badge || undefined, fish: r.species, origin: r.origin,
+      protein: r.nutrition?.protein_g, omega: r.nutrition?.omega3_g, mercury: r.nutrition?.mercury, art: r.art || undefined,
+      tin: r.colors?.length === 2 ? r.colors : ['#fdcd62', '#73c3f5'], image: r.image_path ? supabase.storage.from('product-images').getPublicUrl(r.image_path).data.publicUrl : null,
+      stock: r.stock ?? undefined, price: single ? single.price_cents / 100 : 0, variants,
+      cat: (r.product_collections || []).map((x) => x.collection), sort: i,
+    }
+  })
+  products.splice(0, products.length, ...rows)
+  for (const col of c.data || []) if (collections[col.handle]) Object.assign(collections[col.handle], { title: col.title, blurb: col.blurb, bg: col.color || collections[col.handle].bg })
+  if (st.data) Object.assign(settings, {
+    currency: st.data.currency, freeShip: st.data.free_ship_threshold_cents / 100, shipFlat: st.data.shipping_flat_cents / 100, taxRate: Number(st.data.tax_rate),
+    lowStock: st.data.low_stock_threshold, bankOn: st.data.bank_transfer_enabled, codOn: st.data.cod_enabled,
+    codMax: st.data.cod_max_total_cents != null ? st.data.cod_max_total_cents / 100 : null,
+    announcements: st.data.announcements?.length ? st.data.announcements : settings.announcements,
+  })
+  catalogReady = true
+  bump()
+}

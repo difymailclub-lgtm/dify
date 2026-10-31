@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
 import { BRAND, products, collections, featured, valueProps, canneries, press, recipes, articles, bundleIncludes, boxSizes, faqs, stores, bySlug, inCollection, makeLine, money, packsFor, canGiftTin, canSubscribe, settings, reviewsFor } from './data'
 import { UI } from './art'
-import { Tin, ProductCard, Slider, Accordion, PageHero, useCart, Stars, reviewCount, PayIn4, useReveal, ScrubWords, Icon } from './components'
+import { subscribeEmail } from './components'
+import { Tin, ProductCard, Slider, Accordion, PageHero, useCart, Stars, reviewCount, useReveal, ScrubWords, Icon } from './components'
 
 /* ================= HOME ================= */
 // Original line illustrations for the value props (thick ink outline, flat fills)
@@ -247,6 +248,37 @@ function RecipeCard({ r }) {
   )
 }
 
+/* ================= COMING SOON (bare "/") ================= */
+export function ComingSoon() {
+  const [state, setState] = useState('idle')
+  const [err, setErr] = useState('')
+  useEffect(() => { const t = document.title; document.title = 'dify.homes — coming soon'; return () => { document.title = t } }, [])
+  const submit = async (e) => {
+    e.preventDefault()
+    setState('busy'); setErr('')
+    try { await subscribeEmail(e.currentTarget.email.value, 'coming-soon'); setState('done') } catch (er) { setErr(er.message); setState('idle') }
+  }
+  return (
+    <main className="soon">
+      <div className="soon-art" aria-hidden><Tin p={{ tin: ['#fdcd62', '#73c3f5'] }} scene="hero" label={null} ratio="auto" /></div>
+      <section className="soon-card">
+        <p className="eyebrow">dify.homes</p>
+        <h1>Coming soon.</h1>
+        <p className="soon-lede">Something good is on its way. Leave your email and you’ll be the first to know when we open.</p>
+        {state === 'done' ? <p className="notice" role="status">You’re on the list. See you soon!</p> : (
+          <form onSubmit={submit} className="soon-form">
+            <label htmlFor="soon-email" className="sr-only">Email address</label>
+            <input id="soon-email" name="email" type="email" required autoComplete="email" placeholder="you@example.com" />
+            <button className="btn" disabled={state === 'busy'}>{state === 'busy' ? 'Adding…' : 'Notify me'}</button>
+          </form>
+        )}
+        {err && <p className="err" role="alert">{err}</p>}
+      </section>
+      <footer className="soon-foot">© {new Date().getFullYear()} dify.homes</footer>
+    </main>
+  )
+}
+
 /* ================= COLLECTION ================= */
 export function Collection() {
   const { handle = 'all' } = useParams()
@@ -355,7 +387,6 @@ export function Product() {
                 <button className="btn full" onClick={addIt}>Add to Cart — {money(line.unit * q)}</button>
               </div>
               <button className="btn full express" onClick={buyNow}>Buy it now <UI.bolt className="inl" /></button>
-              <PayIn4 total={line.unit * q} />
             </div>
           )}
           <div className="accs">
@@ -460,7 +491,6 @@ export function Bundles() {
   const tins = products.filter((p) => p.cat.includes('tinned-fish'))
   const [size, setSize] = useState(boxSizes[0])
   const [picks, setPicks] = useState([])
-  const [sub, setSub] = useState(false)
   const [msg, setMsg] = useState('')
   const [sheet, setSheet] = useState(false)
   const full = picks.length >= size.n
@@ -468,19 +498,19 @@ export function Bundles() {
   const unpick = (k) => setPicks(picks.filter((_, j) => j !== k))
   const changeSize = (b) => { setSize(b); setPicks(picks.slice(0, b.n)); setMsg('') }
   const sum = picks.reduce((s, k) => s + bySlug(k).price, 0)
-  const off = (size.off + (sub ? 10 : 0)) / 100
-  const total = sum * (1 - off)
+  const total = sum
   const complete = () => {
     const counts = picks.reduce((m, k) => ({ ...m, [k]: (m[k] || 0) + 1 }), {})
-    Object.entries(counts).forEach(([k, q]) => { const p = bySlug(k); add({ ...makeLine(p), id: `${k}|box${size.n}|${+sub}`, unit: Math.round(p.price * (1 - off) * 100) / 100, compare: p.price, label: `Build Your Own Box (${size.n}) · ${Math.round(off * 100)}% off${sub ? ' · every 4 weeks' : ''}` }, q) })
+    Object.entries(counts).forEach(([k, q]) => add(makeLine(bySlug(k)), q))
+    setMsg('')
     setPicks([])
   }
   return (
     <>
-      <Banner title="Build Your Own Box" sub="Stock up on favorites or try something new." scene="banner" tint={['#f04a49', '#fdcd62']} />
+      <Banner title="Build Your Own Box" sub="Pick 6, 9 or 12 tins — mix and match your favorites." scene="banner" tint={['#f04a49', '#fdcd62']} />
       <section className="builder">
         <div className="b-sizes b-sizes-m" role="radiogroup" aria-label="Box size">
-          {boxSizes.map((b) => <button key={b.n} role="radio" aria-checked={size.n === b.n} className={size.n === b.n ? 'on' : ''} onClick={() => changeSize(b)}>{b.n} Tins<em>{b.off}% Off</em></button>)}
+          {boxSizes.map((b) => <button key={b.n} role="radio" aria-checked={size.n === b.n} className={size.n === b.n ? 'on' : ''} onClick={() => changeSize(b)}>{b.n} Tins</button>)}
         </div>
         <div className="b-grid">
           {tins.map((p) => {
@@ -500,7 +530,7 @@ export function Bundles() {
           <div className="b-step">
             <h2><span className="num">1</span> Pick Your Box Size</h2>
             <div className="b-sizes" role="radiogroup" aria-label="Box size">
-              {boxSizes.map((b) => <button key={b.n} role="radio" aria-checked={size.n === b.n} className={size.n === b.n ? 'on' : ''} onClick={() => changeSize(b)}>{b.n} Tins<em>{b.off}% Off</em></button>)}
+              {boxSizes.map((b) => <button key={b.n} role="radio" aria-checked={size.n === b.n} className={size.n === b.n ? 'on' : ''} onClick={() => changeSize(b)}>{b.n} Tins</button>)}
             </div>
           </div>
           <div className="b-step">
@@ -513,14 +543,9 @@ export function Bundles() {
             </div>
             <p className="b-msg" role="status">{msg}</p>
           </div>
-          <div className="b-step">
-            <h2><span className="num">3</span> Pick Your Frequency</h2>
-            <label className={`b-freq ${!sub ? 'on' : ''}`}><input type="radio" name="freq" checked={!sub} onChange={() => setSub(false)} /> One-time purchase</label>
-            <label className={`b-freq ${sub ? 'on' : ''}`}><input type="radio" name="freq" checked={sub} onChange={() => setSub(true)} /> <span>Subscription<ul><li>Extra 10% off every box</li><li>Swap tins anytime</li><li>Pause or cancel anytime</li></ul></span></label>
-          </div>
-          <div className="b-total"><span>Total:</span><em className="tag-free">Free Shipping</em><em className="tag-off">{Math.round(off * 100)}% off</em><b>{money(total)}</b></div>
+          <div className="b-total"><span>Total:</span>{total >= settings.freeShip && <em className="tag-free">Free Shipping</em>}<b>{money(total)}</b></div>
           <button className="btn full" disabled={!full} onClick={complete}>{full ? 'Complete Your Box' : `Add ${size.n - picks.length} more tin${size.n - picks.length === 1 ? '' : 's'}`}</button>
-          <p className="fine left">Box discounts can't be combined with other promo codes.</p>
+          <p className="fine left">Free shipping on orders over {money(settings.freeShip)}.</p>
         </aside>
       </section>
     </>
@@ -712,5 +737,5 @@ export function Info() {
 }
 
 export function NotFound() {
-  return <section className="sec center notfound"><h1>404</h1><p>This page swam away.</p><Link className="btn" to="/">Back to Home</Link></section>
+  return <section className="sec center notfound"><h1>404</h1><p>This page swam away.</p><Link className="btn" to="/home">Back to Home</Link></section>
 }
