@@ -1,289 +1,538 @@
-import { useState, useEffect, useRef, createContext, useContext } from 'react'
-import { Link, NavLink, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom'
-import { BRAND, products, orders, codes, settings, collections, commit, resetStore, money, shipping } from './data'
+import { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react'
+import { Link, NavLink, Routes, Route, useNavigate, useParams, useLocation, useSearchParams } from 'react-router-dom'
+import { supabase, errText } from './lib/supabase'
 import { Tin } from './components'
-import { UI as Ic } from './art'
+import { UI } from './art'
+import './admin.css'
 
-/* ---------- a11y prefs, toasts, confirm ---------- */
-const UI = createContext()
-const useUI = () => useContext(UI)
-const session = { get: (k) => { try { return sessionStorage.getItem(k) } catch { return null } }, set: (k, v) => { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v) } catch { /* storage unavailable */ } } }
-const loadPrefs = () => { try { return JSON.parse(localStorage.getItem('admin-prefs')) || {} } catch { return {} } }
-
-function useSort(list, key0, dir0 = 'asc') {
-  const [key, setKey] = useState(key0)
-  const [dir, setDir] = useState(dir0)
-  const sorted = [...list].sort((a, b) => {
-    const x = a[key] ?? '', y = b[key] ?? ''
-    const c = typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y))
-    return dir === 'asc' ? c : -c
-  })
-  const th = (k, label, cls) => (
-    <th scope="col" className={cls} aria-sort={key === k ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'}>
-      <button onClick={() => { setDir(key === k && dir === 'asc' ? 'desc' : 'asc'); setKey(k) }}>{label}<span aria-hidden>{key === k ? (dir === 'asc' ? ' ▲' : ' ▼') : ' ↕'}</span></button>
-    </th>
-  )
-  return [sorted, th]
+/* ================= helpers ================= */
+const mk = (d) => function Ic(props) { return <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden {...props}>{d}</svg> }
+const Ic = {
+  ...UI,
+  more: mk(<><circle cx="5" cy="12" r="1.3" /><circle cx="12" cy="12" r="1.3" /><circle cx="19" cy="12" r="1.3" /></>),
+  left: mk(<path d="M15 5 8 12l7 7" />),
+  card: mk(<><rect x="2.5" y="5" width="19" height="14" rx="2" /><path d="M2.5 10h19M6 15h4" /></>),
+  ban: mk(<><circle cx="12" cy="12" r="9" /><path d="m5.6 5.6 12.8 12.8" /></>),
+  phone: mk(<path d="M5 3h4l2 5-2.5 1.5a11 11 0 0 0 6 6L16 13l5 2v4a2 2 0 0 1-2 2A17 17 0 0 1 3 5a2 2 0 0 1 2-2z" />),
+  chat: mk(<path d="M4 20l1.3-3.9A8 8 0 1 1 8 19.3z" />),
+  refresh: mk(<><path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3" /><path d="M5 3v5h5M19 21v-5h-5" /></>),
+  logout: mk(<><path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h11" /></>),
+  ext: mk(<><path d="M14 4h6v6M20 4l-9 9" /><path d="M19 14v5H5V5h5" /></>),
+  plus: mk(<path d="M12 5v14M5 12h14" />),
+  trash: mk(<><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" /></>),
+  search: mk(<><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></>),
+  box: mk(<><path d="M3 7l9-4 9 4v10l-9 4-9-4z" /><path d="M3 7l9 4 9-4M12 11v10" /></>),
+  mailOut: mk(<><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m3 7 9 6 9-6" /></>),
 }
 
-function Confirm({ state, close }) {
-  const ref = useRef()
-  useEffect(() => { if (state) ref.current?.showModal(); else ref.current?.close() }, [state])
+const money = (c, cur = 'USD') => ((c ?? 0) / 100).toLocaleString(undefined, { style: 'currency', currency: cur })
+const when = (d) => (d ? new Date(d).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—')
+const STATUS = {
+  awaiting_payment: ['Awaiting payment', 'warn'], payment_review: ['Payment review', 'info'],
+  awaiting_confirmation: ['Awaiting confirmation', 'warn'], confirmed: ['Confirmed', 'ok'], packed: ['Packed', 'ok'],
+  dispatched: ['Dispatched', 'info'], delivered: ['Delivered', 'done'], cancelled: ['Cancelled', 'bad'], returned: ['Returned', 'bad'],
+}
+const PAY = { unpaid: 'Unpaid', under_review: 'Under review', paid: 'Paid', rejected: 'Rejected', cod_pending: 'COD · pending', cod_collected: 'COD · collected', refunded: 'Refunded' }
+const METHOD = { bank_transfer: 'Bank transfer', cod: 'Cash on delivery' }
+const Pill = ({ s }) => { const [l, t] = STATUS[s] || [s, '']; return <span className={`ad-pill ${t}`}>{l}</span> }
+const clean = (s) => s.replace(/[,()*\\%]/g, ' ').trim() // PostgREST filter strings: strip operator characters
+const csv = (rows, name) => {
+  if (!rows?.length) return
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(new Blob([[Object.keys(rows[0]).map(esc).join(','), ...rows.map((r) => Object.values(r).map(esc).join(','))].join('\n')], { type: 'text/csv' }))
+  a.download = name
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+const imgUrl = (path) => supabase.storage.from('product-images').getPublicUrl(path).data.publicUrl
+
+/* ================= app context ================= */
+const Ctx = createContext()
+const useAdmin = () => useContext(Ctx)
+
+function useQuery(fn, deps) {
+  const { version } = useAdmin()
+  const [n, setN] = useState(0)
+  const [s, set] = useState({ loading: true })
+  useEffect(() => {
+    let live = true
+    set((p) => ({ ...p, loading: true }))
+    Promise.resolve(fn())
+      .then((r) => live && set(r?.error ? { error: r.error, loading: false } : { data: r?.data, count: r?.count, loading: false }))
+      .catch((e) => live && set({ error: e, loading: false }))
+    return () => { live = false }
+  }, [...deps, n, version]) // eslint-disable-line react-hooks/exhaustive-deps
+  return { ...s, reload: () => setN((x) => x + 1) }
+}
+
+const prefsKey = 'admin-prefs'
+const loadPrefs = () => { try { return JSON.parse(localStorage.getItem(prefsKey)) || {} } catch { return {} } }
+
+export function Admin() {
+  const [session, setSession] = useState(undefined)
+  const [isAdmin, setIsAdmin] = useState(null)
+  const [prefs, setPrefs] = useState(loadPrefs)
+  const [toast, setToast] = useState(null)
+  const [dlg, setDlg] = useState(null)
+  const [version, setVersion] = useState(0)
+  const [counts, setCounts] = useState({})
+  const [sheet, setSheet] = useState(false)
+  const loc = useLocation()
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session))
+    const { data } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
+    return () => data.subscription.unsubscribe()
+  }, [])
+  useEffect(() => {
+    if (!session) { setIsAdmin(null); return }
+    supabase.from('admins').select('user_id').eq('user_id', session.user.id).maybeSingle()
+      .then(({ data }) => setIsAdmin(!!data))
+  }, [session])
+  useEffect(() => { try { localStorage.setItem(prefsKey, JSON.stringify(prefs)) } catch { /* storage unavailable */ } }, [prefs])
+  useEffect(() => { setSheet(false); document.querySelector('.ad-main h1')?.focus() }, [loc.pathname])
+  useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 4500); return () => clearTimeout(t) }, [toast])
+
+  const loadCounts = useCallback(async () => {
+    const head = { count: 'exact', head: true }
+    const [p, c, s] = await Promise.all([
+      supabase.from('payment_proofs').select('id', head).eq('status', 'pending'),
+      supabase.from('orders').select('id', head).eq('status', 'awaiting_confirmation'),
+      supabase.from('orders').select('id', head).in('status', ['confirmed', 'packed']),
+    ])
+    setCounts({ proofs: p.count || 0, cod: c.count || 0, ship: s.count || 0 })
+  }, [])
+
+  // realtime: new orders / screenshots refresh the badges and the open page
+  useEffect(() => {
+    if (!isAdmin) return
+    loadCounts()
+    const ch = supabase.channel('admin-live')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, ({ new: o }) => { setToast({ msg: `New order #${o.number} · ${money(o.total_cents, o.currency)}` }); setVersion((v) => v + 1); loadCounts() })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders' }, () => { setVersion((v) => v + 1); loadCounts() })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'payment_proofs' }, () => { setToast({ msg: 'New payment screenshot to review' }); setVersion((v) => v + 1); loadCounts() })
+      .subscribe()
+    return () => { supabase.removeChannel(ch) }
+  }, [isAdmin, loadCounts])
+
+  const notify = (msg, tone) => setToast({ msg, tone, k: Date.now() })
+  const ask = (req) => new Promise((resolve) => setDlg({ ...req, resolve }))
+  const closeDlg = (v) => { dlg?.resolve(v); setDlg(null) }
+  const act = async (p, okMsg) => {
+    const { error } = await p
+    if (error) { notify(errText(error), 'bad'); return false }
+    if (okMsg) notify(okMsg)
+    setVersion((v) => v + 1)
+    loadCounts()
+    return true
+  }
+  const attrs = { 'data-contrast': prefs.contrast ? 'high' : undefined, 'data-text': prefs.text || undefined, 'data-motion': prefs.motion ? 'reduce' : undefined, 'data-theme': prefs.dark ? 'dark' : undefined }
+
+  if (session === undefined) return <div className="admin" {...attrs}><p className="ad-center" role="status">Loading…</p></div>
+  if (!session) return <div className="admin" {...attrs}><Login /></div>
+  if (isAdmin === null) return <div className="admin" {...attrs}><p className="ad-center" role="status">Checking access…</p></div>
+  if (!isAdmin) return (
+    <div className="admin" {...attrs}>
+      <main className="ad-login"><div className="ad-login-card"><h1>No admin access</h1><p className="ad-muted">{session.user.email} is signed in but isn't an admin.</p><button className="ad-btn" onClick={() => supabase.auth.signOut()}>Sign out</button><Link to="/">← Back to store</Link></div></main>
+    </div>
+  )
+
+  const nav = [
+    ['', 'Home', Ic.dash], ['orders', 'Orders', Ic.receipt, counts.cod + counts.ship], ['payments', 'Payments', Ic.card, counts.proofs],
+    ['products', 'Products', Ic.box], ['customers', 'Customers', Ic.users], ['discounts', 'Discounts', Ic.tag],
+    ['reviews', 'Reviews', Ic.star], ['blocklist', 'Blocklist', Ic.ban], ['subscribers', 'Subscribers', Ic.mailOut], ['settings', 'Settings', Ic.gear],
+  ]
+  const toggle = (k, v = true) => setPrefs({ ...prefs, [k]: prefs[k] === v ? undefined : v })
+  const Prefs = (
+    <div className="ad-prefs" role="group" aria-label="Display settings">
+      <button aria-pressed={!!prefs.contrast} onClick={() => toggle('contrast')}><Ic.contrast /> Contrast</button>
+      <button aria-pressed={prefs.text === 'lg'} onClick={() => toggle('text', 'lg')}><Ic.text /> Large text</button>
+      <button aria-pressed={!!prefs.motion} onClick={() => toggle('motion')}><Ic.motion /> Less motion</button>
+      <button aria-pressed={!!prefs.dark} onClick={() => toggle('dark')}><Ic.moon /> Dark</button>
+    </div>
+  )
+  const NavItem = ([to, l, I, badge]) => (
+    <NavLink key={to} to={`/admin/${to}`} end={!to} className="ad-nav-item">
+      <span className="ad-nav-ic"><I />{badge > 0 && <em aria-label={`${badge} need attention`}>{badge}</em>}</span><span>{l}</span>
+    </NavLink>
+  )
+
   return (
-    <dialog ref={ref} className="a-dialog" onClose={() => close(false)} aria-labelledby="dlg-h">
-      <h2 id="dlg-h">{state?.title}</h2>
-      <p>{state?.body}</p>
-      <div className="a-row end">
-        <button className="a-btn" onClick={() => close(false)} autoFocus>Cancel</button>
-        <button className="a-btn danger" onClick={() => close(true)}>{state?.ok || 'Confirm'}</button>
+    <Ctx.Provider value={{ notify, ask, act, version, counts, loadCounts }}>
+      <div className="admin" {...attrs}>
+        <a href="#ad-main" className="skip">Skip to main content</a>
+        <aside className="ad-side" aria-label="Admin">
+          <Link to="/admin" className="ad-brand">Brinebird <small>Admin</small></Link>
+          <nav className="ad-side-nav">{nav.map(NavItem)}</nav>
+          <div className="ad-side-foot">
+            {Prefs}
+            <a className="ad-btn ghost" href="/" target="_blank" rel="noreferrer"><Ic.ext /> View store</a>
+            <button className="ad-btn ghost" onClick={() => supabase.auth.signOut()}><Ic.logout /> Sign out</button>
+          </div>
+        </aside>
+        <main id="ad-main" className="ad-main" tabIndex={-1}>
+          <Routes>
+            <Route index element={<Dashboard />} />
+            <Route path="orders" element={<Orders />} />
+            <Route path="orders/:id" element={<OrderDetail />} />
+            <Route path="payments" element={<Payments />} />
+            <Route path="products" element={<Products />} />
+            <Route path="products/:id" element={<ProductEdit />} />
+            <Route path="customers" element={<Customers />} />
+            <Route path="discounts" element={<Discounts />} />
+            <Route path="reviews" element={<Reviews />} />
+            <Route path="blocklist" element={<Blocklist />} />
+            <Route path="subscribers" element={<Subscribers />} />
+            <Route path="settings" element={<Settings />} />
+            <Route path="*" element={<Head title="Not found" />} />
+          </Routes>
+        </main>
+        {/* phone: bottom tabs + "More" sheet */}
+        <nav className="ad-tabs" aria-label="Admin">
+          {nav.slice(0, 4).map(NavItem)}
+          <button className="ad-nav-item" aria-expanded={sheet} aria-controls="ad-sheet" onClick={() => setSheet(!sheet)}><span className="ad-nav-ic"><Ic.more /></span><span>More</span></button>
+        </nav>
+        {sheet && <div className="ad-scrim" onClick={() => setSheet(false)} />}
+        <div id="ad-sheet" className={`ad-sheet ${sheet ? 'on' : ''}`} role="dialog" aria-modal="true" aria-label="More" hidden={!sheet}>
+          <nav className="ad-sheet-grid">{nav.slice(4).map(NavItem)}</nav>
+          {Prefs}
+          <div className="ad-row"><a className="ad-btn" href="/" target="_blank" rel="noreferrer"><Ic.ext /> View store</a><button className="ad-btn" onClick={() => supabase.auth.signOut()}><Ic.logout /> Sign out</button></div>
+        </div>
+        <div className="ad-toast" role="status" aria-live="polite">{toast && <span key={toast.k} className={toast.tone}>{toast.msg}</span>}</div>
+        <AskDialog req={dlg} done={closeDlg} />
       </div>
+    </Ctx.Provider>
+  )
+}
+
+/* ================= shared UI ================= */
+function Head({ title, back, actions, sub }) {
+  return (
+    <header className="ad-head">
+      {back && <Link to={back} className="ad-icon-btn" aria-label="Back"><Ic.left /></Link>}
+      <div className="ad-head-t"><h1 tabIndex={-1}>{title}</h1>{sub && <p className="ad-muted">{sub}</p>}</div>
+      {actions && <div className="ad-head-actions">{actions}</div>}
+    </header>
+  )
+}
+
+function Field({ name, label, type = 'text', required, options, defaultValue, hint, ...rest }) {
+  const id = `f-${name}`
+  if (type === 'checkbox') return <label className="ad-check"><input type="checkbox" name={name} defaultChecked={!!defaultValue} {...rest} /> {label}</label>
+  return (
+    <div className="ad-field">
+      <label htmlFor={id}>{label}{required && <span aria-hidden> *</span>}</label>
+      {type === 'select' ? <select id={id} name={name} defaultValue={defaultValue} required={required} {...rest}>{options.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select>
+        : type === 'textarea' ? <textarea id={id} name={name} defaultValue={defaultValue} required={required} rows={3} {...rest} />
+        : <input id={id} name={name} type={type} defaultValue={defaultValue} required={required} aria-describedby={hint ? `${id}-h` : undefined} {...rest} />}
+      {hint && <small id={`${id}-h`} className="ad-muted">{hint}</small>}
+    </div>
+  )
+}
+
+function AskDialog({ req, done }) {
+  const ref = useRef()
+  useEffect(() => { if (req) ref.current?.showModal(); else if (ref.current?.open) ref.current.close() }, [req])
+  return (
+    <dialog ref={ref} className="ad-dialog" onCancel={(e) => { e.preventDefault(); done(null) }} aria-labelledby="ad-dlg-h">
+      {req && (
+        <form onSubmit={(e) => { e.preventDefault(); done(Object.fromEntries(new FormData(e.currentTarget))) }}>
+          <h2 id="ad-dlg-h">{req.title}</h2>
+          {req.body && <p>{req.body}</p>}
+          {req.fields?.map((f) => <Field key={f.name} {...f} />)}
+          <div className="ad-dlg-actions">
+            <button type="button" className="ad-btn" onClick={() => done(null)}>Cancel</button>
+            <button className={`ad-btn ${req.danger ? 'danger' : 'primary'}`} autoFocus={!req.fields}>{req.ok || 'Confirm'}</button>
+          </div>
+        </form>
+      )}
     </dialog>
   )
 }
 
-/* ---------- Shell ---------- */
-const NAV = [['', 'Dashboard', Ic.dash], ['orders', 'Orders', Ic.receipt], ['products', 'Products', Ic.fish], ['customers', 'Customers', Ic.users], ['discounts', 'Discounts', Ic.tag], ['settings', 'Settings', Ic.gear]]
+const State = ({ q, empty, children }) =>
+  q.loading && !q.data ? <p className="ad-muted ad-pad" role="status">Loading…</p>
+    : q.error ? <p className="ad-err ad-pad" role="alert">{errText(q.error)} <button className="ad-link" onClick={q.reload}>Retry</button></p>
+    : !q.data?.length && empty ? <div className="ad-empty">{empty}</div>
+    : children
 
-export function Admin() {
-  const [authed, setAuthed] = useState(() => session.get('admin') === '1')
-  const [prefs, setPrefs] = useState(loadPrefs)
-  const [toast, setToast] = useState('')
-  const [dlg, setDlg] = useState(null)
-  const [menu, setMenu] = useState(false)
-  const loc = useLocation()
-  useEffect(() => { try { localStorage.setItem('admin-prefs', JSON.stringify(prefs)) } catch { /* storage unavailable */ } }, [prefs])
-  useEffect(() => { setMenu(false); document.querySelector('.a-main h1')?.focus() }, [loc.pathname])
-  useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(''), 4000); return () => clearTimeout(t) }, [toast])
-  const confirm = (opts) => new Promise((res) => setDlg({ ...opts, res }))
-  const closeDlg = (v) => { dlg?.res(v); setDlg(null) }
-  const notify = (m) => { setToast(''); setTimeout(() => setToast(m), 30) }
-  const attrs = { 'data-contrast': prefs.contrast ? 'high' : undefined, 'data-text': prefs.text || undefined, 'data-motion': prefs.motion ? 'reduce' : undefined, 'data-theme': prefs.dark ? 'dark' : undefined }
-
-  if (!authed) return <div className="admin" {...attrs}><Login onOk={() => { session.set('admin', '1'); setAuthed(true) }} /></div>
-  const toggle = (k) => setPrefs({ ...prefs, [k]: !prefs[k] })
-
-  return (
-    <UI.Provider value={{ notify, confirm }}>
-      <div className="admin" {...attrs}>
-        <a href="#a-main" className="skip">Skip to main content</a>
-        <header className="a-top">
-          <button className="a-burger" onClick={() => setMenu(!menu)} aria-expanded={menu} aria-controls="a-nav" aria-label="Toggle navigation"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden><path d="M4 7h16M4 12h16M4 17h16" /></svg></button>
-          <Link to="/admin" className="a-logo">{BRAND} <small>Admin</small></Link>
-          <div className="a-prefs" role="group" aria-label="Accessibility settings">
-            <button aria-pressed={!!prefs.contrast} onClick={() => toggle('contrast')} title="High contrast"><Ic.contrast /> <span className="a-hide-sm">Contrast</span></button>
-            <button aria-pressed={prefs.text === 'lg'} onClick={() => setPrefs({ ...prefs, text: prefs.text === 'lg' ? '' : 'lg' })} title="Larger text"><Ic.text /> <span className="a-hide-sm">Text</span></button>
-            <button aria-pressed={!!prefs.motion} onClick={() => toggle('motion')} title="Reduce motion"><Ic.motion /> <span className="a-hide-sm">Motion</span></button>
-            <button aria-pressed={!!prefs.dark} onClick={() => toggle('dark')} title="Dark mode"><Ic.moon /> <span className="a-hide-sm">Dark</span></button>
-          </div>
-          <Link to="/" className="a-btn ghost">View store ↗</Link>
-          <button className="a-btn ghost" onClick={() => { session.set('admin', null); setAuthed(false) }}>Log out</button>
-        </header>
-        <div className="a-body">
-          <nav id="a-nav" className={`a-nav ${menu ? 'on' : ''}`} aria-label="Admin">
-            {NAV.map(([to, l, NavIcon]) => <NavLink key={to} to={`/admin/${to}`} end={!to}><NavIcon /> {l}{to === 'orders' && <em className="a-pill">{orders.filter((o) => o.fulfillment === 'Unfulfilled' && o.status === 'Paid').length || ''}</em>}</NavLink>)}
-          </nav>
-          <main id="a-main" className="a-main" tabIndex={-1}>
-            <Routes>
-              <Route index element={<Dashboard />} />
-              <Route path="orders" element={<Orders />} />
-              <Route path="orders/:id" element={<OrderDetail />} />
-              <Route path="products" element={<Products />} />
-              <Route path="products/:slug" element={<ProductForm />} />
-              <Route path="customers" element={<Customers />} />
-              <Route path="discounts" element={<Discounts />} />
-              <Route path="settings" element={<Settings />} />
-              <Route path="*" element={<h1 tabIndex={-1}>Not found</h1>} />
-            </Routes>
-          </main>
-        </div>
-        <div className="a-toast" role="status" aria-live="polite">{toast && <span>{toast}</span>}</div>
-        <Confirm state={dlg} close={closeDlg} />
-      </div>
-    </UI.Provider>
-  )
-}
-
-function Login({ onOk }) {
-  const [v, setV] = useState('')
+/* ================= login ================= */
+function Login() {
   const [err, setErr] = useState('')
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+  const submit = async (e) => {
+    e.preventDefault()
+    const f = Object.fromEntries(new FormData(e.currentTarget))
+    setBusy(true); setErr('')
+    const { error } = await supabase.auth.signInWithPassword({ email: f.email, password: f.password })
+    setBusy(false)
+    if (error) setErr(error.message)
+  }
+  const reset = async () => {
+    const email = document.getElementById('f-email').value
+    if (!email) return setErr('Enter your email first.')
+    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${location.origin}/admin` })
+    if (error) setErr(error.message); else setMsg('If that account exists, a reset link is on its way.')
+  }
   return (
-    <main className="a-login">
-      <form onSubmit={(e) => { e.preventDefault(); v === settings.adminPass ? onOk() : setErr('Incorrect passcode. Try again.') }}>
-        <h1>{BRAND} Admin</h1>
-        <p className="a-muted">Demo gate only. Real authentication must run on your server.</p>
-        <label htmlFor="pass">Passcode</label>
-        <input id="pass" type="password" value={v} onChange={(e) => setV(e.target.value)} aria-invalid={!!err} aria-describedby={err ? 'pass-err' : 'pass-hint'} autoFocus autoComplete="current-password" />
-        <small id="pass-hint" className="a-muted">Default passcode: admin (change it in Settings)</small>
-        {err && <p id="pass-err" className="a-err" role="alert">{err}</p>}
-        <button className="a-btn primary">Log in</button>
+    <main className="ad-login">
+      <form className="ad-login-card" onSubmit={submit} aria-describedby={err ? 'login-err' : undefined}>
+        <h1>Brinebird Admin</h1>
+        <Field name="email" label="Email" type="email" autoComplete="username" required autoFocus />
+        <Field name="password" label="Password" type="password" autoComplete="current-password" required />
+        {err && <p id="login-err" className="ad-err" role="alert">{err}</p>}
+        {msg && <p role="status">{msg}</p>}
+        <button className="ad-btn primary full" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+        <button type="button" className="ad-link" onClick={reset}>Forgot password?</button>
         <Link to="/">← Back to store</Link>
       </form>
     </main>
   )
 }
 
-const H = ({ children, actions }) => <div className="a-head"><h1 tabIndex={-1}>{children}</h1>{actions && <div className="a-row">{actions}</div>}</div>
-const Badge = ({ v }) => <span className={`a-badge s-${String(v).toLowerCase().replace(/\s/g, '-')}`}>{v}</span>
-const fmtDate = (d) => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
-
-/* ---------- Dashboard ---------- */
+/* ================= dashboard ================= */
 function Dashboard() {
-  const paid = orders.filter((o) => !['Refunded', 'Cancelled'].includes(o.status))
-  const revenue = paid.reduce((s, o) => s + o.total, 0)
-  const units = paid.reduce((s, o) => s + o.lines.reduce((a, l) => a + l.q, 0), 0)
-  const days = Array.from({ length: 14 }, (_, i) => {
-    const d = new Date(); d.setDate(d.getDate() - 13 + i)
-    const k = d.toISOString().slice(0, 10)
-    return { k, label: d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), v: paid.filter((o) => o.date.slice(0, 10) === k).reduce((s, o) => s + o.total, 0) }
-  })
-  const max = Math.max(1, ...days.map((d) => d.v))
-  const top = Object.values(paid.flatMap((o) => o.lines).reduce((m, l) => { m[l.slug] = m[l.slug] || { name: l.name, q: 0, rev: 0 }; m[l.slug].q += l.q; m[l.slug].rev += l.unit * l.q; return m }, {})).sort((a, b) => b.rev - a.rev).slice(0, 5)
-  const low = products.filter((p) => p.stock != null && p.stock < settings.lowStock).sort((a, b) => a.stock - b.stock)
+  const { counts } = useAdmin()
+  const q = useQuery(() => supabase.rpc('admin_stats', { p_days: 14 }), [])
+  const recent = useQuery(() => supabase.from('orders').select('id, number, email, status, total_cents, currency, created_at').order('created_at', { ascending: false }).limit(6), [])
+  const s = q.data
+  const max = Math.max(1, ...(s?.daily || []).map((d) => d.total_cents))
   return (
     <>
-      <H>Dashboard</H>
-      <section className="a-kpis" aria-label="Key metrics">
-        {[['Revenue', money(revenue)], ['Orders', paid.length], ['Avg. order value', money(paid.length ? revenue / paid.length : 0)], ['Units sold', units]].map(([l, v]) => <div key={l} className="a-card kpi"><span>{l}</span><b>{v}</b></div>)}
+      <Head title="Dashboard" actions={<button className="ad-icon-btn" onClick={q.reload} aria-label="Refresh"><Ic.refresh /></button>} />
+      <section className="ad-todo" aria-label="Needs your attention">
+        <Link to="/admin/payments" className={`ad-todo-tile ${counts.proofs ? 'hot' : ''}`}><Ic.card /><b>{counts.proofs ?? '–'}</b><span>Payments to review</span></Link>
+        <Link to="/admin/orders?f=awaiting_confirmation" className={`ad-todo-tile ${counts.cod ? 'hot' : ''}`}><Ic.phone /><b>{counts.cod ?? '–'}</b><span>COD to confirm</span></Link>
+        <Link to="/admin/orders?f=to_ship" className={`ad-todo-tile ${counts.ship ? 'hot' : ''}`}><Ic.truck /><b>{counts.ship ?? '–'}</b><span>Ready to ship</span></Link>
       </section>
-      <div className="a-grid2">
-        <section className="a-card">
-          <h2 id="chart-h">Revenue, last 14 days</h2>
-          <div className="a-chart" role="img" aria-labelledby="chart-h" aria-describedby="chart-t">
-            {days.map((d) => <div key={d.k} className="a-barcol" title={`${d.label}: ${money(d.v)}`}><span style={{ height: `${(d.v / max) * 100}%` }} /><small>{d.label.split(' ')[1]}</small></div>)}
-          </div>
-          <details><summary>View as table</summary>
-            <table id="chart-t" className="a-table"><caption className="sr-only">Daily revenue</caption><thead><tr><th scope="col">Day</th><th scope="col">Revenue</th></tr></thead><tbody>{days.map((d) => <tr key={d.k}><td>{d.label}</td><td>{money(d.v)}</td></tr>)}</tbody></table>
-          </details>
-        </section>
-        <section className="a-card">
-          <h2>Top products</h2>
-          {top.length ? <ol className="a-list">{top.map((t) => <li key={t.name}><span>{t.name}</span><b>{money(t.rev)}</b><small>{t.q} sold</small></li>)}</ol> : <p className="a-muted">No sales yet. Place a test order on the storefront.</p>}
-        </section>
-        <section className="a-card">
-          <h2>Low stock <Badge v={low.length} /></h2>
-          {low.length ? <ul className="a-list">{low.map((p) => <li key={p.slug}><Link to={`/admin/products/${p.slug}`}>{p.name}</Link><b className={p.stock === 0 ? 'a-err' : ''}>{p.stock === 0 ? 'Out of stock' : `${p.stock} left`}</b></li>)}</ul> : <p className="a-muted">All stocked up.</p>}
-        </section>
-        <section className="a-card">
-          <h2>Recent orders</h2>
-          {orders.length ? <ul className="a-list">{[...orders].reverse().slice(0, 5).map((o) => <li key={o.id}><Link to={`/admin/orders/${o.id}`}>#{o.id}</Link><span>{o.customer.first} {o.customer.last}</span><b>{money(o.total)}</b></li>)}</ul> : <p className="a-muted">No orders yet.</p>}
-        </section>
-      </div>
+      <State q={q}>
+        {s && (
+          <>
+            <section className="ad-kpis" aria-label="Key numbers">
+              <div className="ad-card"><span>Revenue (paid)</span><b>{money(s.revenue_cents)}</b></div>
+              <div className="ad-card"><span>Orders</span><b>{s.orders}</b></div>
+              <div className="ad-card"><span>Avg. order</span><b>{money(s.orders ? s.revenue_cents / Math.max(1, s.orders) : 0)}</b></div>
+            </section>
+            <section className="ad-card">
+              <h2 id="chart-h">Sales, last 14 days</h2>
+              <div className="ad-chart" role="img" aria-labelledby="chart-h" aria-describedby="chart-t">
+                {s.daily.map((d) => <div key={d.day} className="ad-bar" title={`${d.day}: ${money(d.total_cents)}`}><span style={{ height: `${(d.total_cents / max) * 100}%` }} /><small>{d.day.slice(8)}</small></div>)}
+              </div>
+              <details><summary>Show as table</summary>
+                <table id="chart-t" className="ad-table"><thead><tr><th scope="col">Day</th><th scope="col">Sales</th></tr></thead><tbody>{s.daily.map((d) => <tr key={d.day}><td>{d.day}</td><td>{money(d.total_cents)}</td></tr>)}</tbody></table>
+              </details>
+            </section>
+            {!!s.low_stock.length && (
+              <section className="ad-card"><h2>Low stock</h2>
+                <ul className="ad-list">{s.low_stock.map((p) => <li key={p.slug}><span>{p.name}</span><b className={p.stock === 0 ? 'ad-err' : ''}>{p.stock === 0 ? 'Sold out' : `${p.stock} left`}</b></li>)}</ul>
+              </section>
+            )}
+          </>
+        )}
+      </State>
+      <section className="ad-card"><h2>Latest orders</h2>
+        <State q={recent} empty="No orders yet.">
+          <ul className="ad-rows">{recent.data?.map((o) => <OrderRow key={o.id} o={o} />)}</ul>
+        </State>
+      </section>
     </>
   )
 }
 
-/* ---------- Orders ---------- */
-const FULFILL = ['Unfulfilled', 'Fulfilled', 'Shipped', 'Delivered']
+/* ================= orders ================= */
+const FILTERS = [
+  ['needs', 'Needs action', ['payment_review', 'awaiting_confirmation', 'confirmed', 'packed']],
+  ['all', 'All', null],
+  ['awaiting_payment', 'Awaiting payment', ['awaiting_payment']],
+  ['payment_review', 'Payment review', ['payment_review']],
+  ['awaiting_confirmation', 'COD to confirm', ['awaiting_confirmation']],
+  ['to_ship', 'To ship', ['confirmed', 'packed']],
+  ['dispatched', 'Dispatched', ['dispatched']],
+  ['delivered', 'Delivered', ['delivered']],
+  ['closed', 'Cancelled / returned', ['cancelled', 'returned']],
+]
+const PAGE = 25
 
-function exportCSV(rows, name) {
-  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
-  const csv = [Object.keys(rows[0]).map(esc).join(','), ...rows.map((r) => Object.values(r).map(esc).join(','))].join('\n')
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
-  a.download = name
-  a.click()
-  URL.revokeObjectURL(a.href)
+function OrderRow({ o }) {
+  return (
+    <li>
+      <Link to={`/admin/orders/${o.id}`} className="ad-order-row">
+        <span className="ad-or-num">#{o.number}</span>
+        <span className="ad-or-who">{o.shipping_address?.name || o.email}<small>{o.email}</small></span>
+        <Pill s={o.status} />
+        <b className="ad-or-total">{money(o.total_cents, o.currency)}</b>
+        <small className="ad-or-meta">{METHOD[o.payment_method] || ''}{o.created_at && ` · ${when(o.created_at)}`}</small>
+      </Link>
+    </li>
+  )
 }
 
 function Orders() {
-  const [q, setQ] = useState(new URLSearchParams(useLocation().search).get('q') || '')
-  const [f, setF] = useState('All')
-  const rows = orders.map((o) => ({ ...o, name: `${o.customer.first} ${o.customer.last}`, email: o.customer.email, items: o.lines.reduce((a, l) => a + l.q, 0) }))
-    .filter((o) => (f === 'All' || o.fulfillment === f || o.status === f) && `${o.id} ${o.name} ${o.email}`.toLowerCase().includes(q.toLowerCase()))
-  const [sorted, th] = useSort(rows, 'date', 'desc')
+  const [params, setParams] = useSearchParams()
+  const f = params.get('f') || 'needs'
+  const search = params.get('q') || ''
+  const [page, setPage] = useState(0)
+  const [text, setText] = useState(search)
+  useEffect(() => setPage(0), [f, search])
+  const q = useQuery(() => {
+    let r = supabase.from('orders').select('id, number, email, status, payment_method, total_cents, currency, created_at, shipping_address', { count: 'exact' })
+      .order('created_at', { ascending: false }).range(page * PAGE, page * PAGE + PAGE - 1)
+    const statuses = FILTERS.find(([k]) => k === f)?.[2]
+    if (statuses) r = r.in('status', statuses)
+    const s = clean(search)
+    if (/^#?\d+$/.test(s)) r = r.eq('number', Number(s.replace('#', '')))
+    else if (s) r = r.or(`email.ilike.*${s}*,phone.ilike.*${s}*`)
+    return r
+  }, [f, search, page])
+  const set = (k, v) => { const p = new URLSearchParams(params); v ? p.set(k, v) : p.delete(k); setParams(p, { replace: true }) }
+  const pages = Math.ceil((q.count || 0) / PAGE)
   return (
     <>
-      <H actions={<button className="a-btn" disabled={!orders.length} onClick={() => exportCSV(orders.map((o) => ({ id: o.id, date: o.date, email: o.customer.email, name: `${o.customer.first} ${o.customer.last}`, total: o.total, status: o.status, fulfillment: o.fulfillment, code: o.code })), 'orders.csv')}>Export CSV</button>}>Orders</H>
-      <div className="a-toolbar">
-        <label className="a-search"><span className="sr-only">Search orders</span><input type="search" placeholder="Search by order #, name or email" value={q} onChange={(e) => setQ(e.target.value)} /></label>
-        <div className="a-tabs" role="group" aria-label="Filter by status">{['All', ...FULFILL, 'Refunded', 'Cancelled'].map((s) => <button key={s} aria-pressed={f === s} onClick={() => setF(s)}>{s}</button>)}</div>
+      <Head title="Orders" sub={q.count != null ? `${q.count} ${q.count === 1 ? 'order' : 'orders'}` : null}
+        actions={<button className="ad-icon-btn" onClick={q.reload} aria-label="Refresh"><Ic.refresh /></button>} />
+      <form className="ad-search" role="search" onSubmit={(e) => { e.preventDefault(); set('q', text.trim()) }}>
+        <label htmlFor="o-q" className="sr-only">Search orders</label>
+        <Ic.search />
+        <input id="o-q" type="search" inputMode="search" placeholder="Order #, email or phone" value={text} onChange={(e) => { setText(e.target.value); if (!e.target.value) set('q', '') }} />
+      </form>
+      <div className="ad-chips" role="group" aria-label="Filter orders">
+        {FILTERS.map(([k, l]) => <button key={k} aria-pressed={f === k} onClick={() => set('f', k)}>{l}</button>)}
       </div>
-      <p className="sr-only" role="status">{sorted.length} orders shown</p>
-      <div className="a-card flush">
-        <table className="a-table">
-          <caption className="sr-only">Orders, sortable by column</caption>
-          <thead><tr>{th('id', 'Order')}{th('date', 'Date')}{th('name', 'Customer')}{th('total', 'Total', 'num')}{th('status', 'Payment')}{th('fulfillment', 'Fulfillment')}{th('items', 'Items', 'num')}</tr></thead>
-          <tbody>
-            {sorted.map((o) => (
-              <tr key={o.id}>
-                <th scope="row"><Link to={`/admin/orders/${o.id}`}>#{o.id}</Link></th>
-                <td>{fmtDate(o.date)}</td><td>{o.name}<br /><small className="a-muted">{o.email}</small></td><td className="num">{money(o.total)}</td>
-                <td><Badge v={o.status} /></td><td><Badge v={o.fulfillment} /></td><td className="num">{o.items}</td>
-              </tr>
-            ))}
-            {!sorted.length && <tr><td colSpan={7} className="a-empty">No orders match. Place a test order on the storefront to see it here.</td></tr>}
-          </tbody>
-        </table>
-      </div>
+      <State q={q} empty={f === 'needs' ? 'All caught up. Nothing needs action right now.' : 'No orders match.'}>
+        <ul className="ad-rows">{q.data?.map((o) => <OrderRow key={o.id} o={o} />)}</ul>
+        {pages > 1 && (
+          <nav className="ad-pager" aria-label="Pages">
+            <button className="ad-btn" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button>
+            <span>Page {page + 1} of {pages}</span>
+            <button className="ad-btn" disabled={page + 1 >= pages} onClick={() => setPage(page + 1)}>Next</button>
+          </nav>
+        )}
+      </State>
     </>
   )
+}
+
+function ProofImage({ path }) {
+  const [url, setUrl] = useState(null)
+  useEffect(() => {
+    let live = true
+    supabase.storage.from('payment-proofs').createSignedUrl(path, 300).then(({ data }) => live && setUrl(data?.signedUrl))
+    return () => { live = false }
+  }, [path])
+  if (!url) return <div className="ad-proof-ph" role="status">Loading screenshot…</div>
+  return path.endsWith('.pdf')
+    ? <a className="ad-btn" href={url} target="_blank" rel="noreferrer"><Ic.ext /> Open PDF</a>
+    : <a href={url} target="_blank" rel="noreferrer" className="ad-proof"><img src={url} alt="Payment screenshot uploaded by the customer" loading="lazy" /><span>Open full size</span></a>
+}
+
+function useProofReview() {
+  const { ask, act } = useAdmin()
+  return {
+    approve: async (proof, order) => {
+      const v = await ask({ title: `Approve payment for #${order.number}?`, body: `Check that the screenshot shows ${money(order.total_cents, order.currency)} and reference #${order.number}.`, ok: 'Approve payment',
+        fields: [{ name: 'ref', label: 'Bank transaction ID (optional)', hint: 'Stops the same transfer being used for another order.' }] })
+      return v && act(supabase.rpc('review_payment_proof', { p_proof: proof.id, p_approve: true, p_transaction_ref: v.ref || null }), `Payment approved. Order #${order.number} confirmed.`)
+    },
+    reject: async (proof, order) => {
+      const v = await ask({ title: `Reject payment for #${order.number}?`, ok: 'Reject', danger: true, body: 'The customer can upload a new screenshot.',
+        fields: [{ name: 'reason', label: 'Reason (shown to the customer)', type: 'textarea', required: true, maxLength: 500, placeholder: 'e.g. The amount doesn’t match the order total.' }] })
+      return v && act(supabase.rpc('review_payment_proof', { p_proof: proof.id, p_approve: false, p_reason: v.reason }), `Payment rejected for #${order.number}.`)
+    },
+  }
 }
 
 function OrderDetail() {
   const { id } = useParams()
-  const { notify, confirm } = useUI()
-  const [note, setNote] = useState('')
-  const o = orders.find((x) => x.id === id)
-  if (!o) return <H>Order not found</H>
-  const update = (patch, msg) => { Object.assign(o, patch); commit(); notify(msg) }
-  const refund = async (status) => {
-    if (!(await confirm({ title: `${status === 'Refunded' ? 'Refund' : 'Cancel'} order #${o.id}?`, body: `This marks the order ${status.toLowerCase()} and returns items to stock.`, ok: status === 'Refunded' ? 'Refund' : 'Cancel order' }))) return
-    o.lines.forEach((l) => { const p = products.find((x) => x.slug === l.slug); if (p?.stock != null) p.stock += l.q * l.pack })
-    update({ status, notes: [...o.notes, { at: new Date().toISOString(), text: `Order ${status.toLowerCase()}, items restocked` }] }, `Order #${o.id} ${status.toLowerCase()}`)
+  const { ask, act } = useAdmin()
+  const review = useProofReview()
+  const q = useQuery(() => supabase.from('orders').select('*, order_items(*), order_events(*), payment_proofs(*), notifications(*)').eq('id', id).single(), [id])
+  const o = q.data
+  if (!o) return <><Head title="Order" back="/admin/orders" /><State q={q}>{null}</State></>
+
+  const move = async (to, opts = {}) => {
+    const v = opts.fields || opts.body ? await ask({ title: opts.title, body: opts.body, fields: opts.fields, ok: opts.ok, danger: opts.danger }) : {}
+    if (!v) return
+    const fields = v.courier || v.tracking ? { courier: v.courier, tracking_number: v.tracking } : {}
+    act(supabase.rpc('transition_order', { p_order: o.id, p_to: to, p_note: v.note || opts.note || null, p_fields: fields }), opts.done)
   }
-  const closed = ['Refunded', 'Cancelled'].includes(o.status)
+  const cancel = () => move('cancelled', { title: `Cancel order #${o.number}?`, body: 'Held stock goes back on sale.', ok: 'Cancel order', danger: true, done: 'Order cancelled', fields: [{ name: 'note', label: 'Reason (internal)', type: 'textarea', required: true }] })
+  const pending = o.payment_proofs.find((p) => p.status === 'pending')
+  const phone = o.phone?.replace(/[^\d]/g, '')
+  const waText = encodeURIComponent(`Hi ${o.shipping_address?.name || ''}! This is Brinebird about order #${o.number} (${money(o.total_cents, o.currency)}, cash on delivery). Can you confirm you'd like us to ship it? Reply YES or NO.`)
+  const actions = {
+    payment_review: pending && <><button className="ad-btn primary" onClick={() => review.approve(pending, o)}><Ic.check /> Approve payment</button><button className="ad-btn danger" onClick={() => review.reject(pending, o)}>Reject</button></>,
+    awaiting_payment: <button className="ad-btn danger" onClick={cancel}>Cancel order</button>,
+    awaiting_confirmation: <><button className="ad-btn primary" onClick={() => move('confirmed', { title: `Mark #${o.number} confirmed?`, body: 'Use this when the customer confirmed by phone or WhatsApp.', ok: 'Confirm order', done: 'Order confirmed', fields: [{ name: 'note', label: 'How did they confirm? (internal)', placeholder: 'e.g. Confirmed on WhatsApp' }] })}><Ic.check /> Confirm order</button><button className="ad-btn danger" onClick={cancel}>Cancel</button></>,
+    confirmed: <><button className="ad-btn primary" onClick={() => move('packed', { done: 'Marked packed' })}><Ic.box /> Mark packed</button><DispatchBtn move={move} o={o} /><button className="ad-btn danger" onClick={cancel}>Cancel</button></>,
+    packed: <><DispatchBtn move={move} o={o} primary /><button className="ad-btn danger" onClick={cancel}>Cancel</button></>,
+    dispatched: <><button className="ad-btn primary" onClick={() => move('delivered', { title: `Mark #${o.number} delivered?`, body: o.payment_method === 'cod' ? `This also records ${money(o.total_cents, o.currency)} cash as collected.` : undefined, ok: 'Mark delivered', done: 'Marked delivered' })}><Ic.check /> Mark delivered</button><button className="ad-btn" onClick={() => move('returned', { title: 'Mark as returned?', ok: 'Mark returned', danger: true, done: 'Marked returned', fields: [{ name: 'note', label: 'Reason', type: 'textarea', required: true }] })}>Returned</button></>,
+    delivered: <button className="ad-btn" onClick={() => move('returned', { title: 'Mark as returned?', ok: 'Mark returned', danger: true, done: 'Marked returned', fields: [{ name: 'note', label: 'Reason', type: 'textarea', required: true }] })}>Mark returned</button>,
+  }[o.status]
+  const addNote = async (e) => {
+    e.preventDefault()
+    const form = e.currentTarget
+    const note = new FormData(form).get('note')
+    if (await act(supabase.rpc('add_order_note', { p_order: o.id, p_note: note }), 'Note added')) form.reset()
+  }
+  const a = o.shipping_address || {}
   return (
     <>
-      <H actions={<><button className="a-btn" onClick={() => window.print()}>Print packing slip</button>{!closed && <><button className="a-btn" onClick={() => refund('Cancelled')}>Cancel</button><button className="a-btn danger" onClick={() => refund('Refunded')}>Refund</button></>}</>}>
-        <Link to="/admin/orders" className="a-back" aria-label="Back to orders">←</Link> Order #{o.id} <Badge v={o.status} /> <Badge v={o.fulfillment} />
-      </H>
-      <p className="a-muted">{new Date(o.date).toLocaleString()}</p>
-      <div className="a-grid2 wide">
-        <div className="a-stack">
-          <section className="a-card print">
-            <h2>Items</h2>
-            <table className="a-table">
-              <caption className="sr-only">Order items</caption>
-              <thead><tr><th scope="col">Product</th><th scope="col" className="num">Qty</th><th scope="col" className="num">Price</th><th scope="col" className="num">Total</th></tr></thead>
-              <tbody>{o.lines.map((l) => <tr key={l.id}><td>{l.name}{l.label && <><br /><small className="a-muted">{l.label}</small></>}</td><td className="num">{l.q}</td><td className="num">{money(l.unit)}</td><td className="num">{money(l.unit * l.q)}</td></tr>)}</tbody>
-              <tfoot>
-                <tr><td colSpan={3}>Subtotal</td><td className="num">{money(o.subtotal)}</td></tr>
-                {o.discount > 0 && <tr><td colSpan={3}>Discount ({o.code})</td><td className="num">−{money(o.discount)}</td></tr>}
-                <tr><td colSpan={3}>Shipping ({shipping.find((s) => s.id === o.ship)?.label})</td><td className="num">{money(o.shipCost)}</td></tr>
-                <tr><td colSpan={3}>Tax</td><td className="num">{money(o.tax)}</td></tr>
-                <tr><th scope="row" colSpan={3}>Total</th><th className="num">{money(o.total)}</th></tr>
-              </tfoot>
-            </table>
-            {o.note && <p><b>Gift note:</b> “{o.note}”</p>}
+      <Head title={`Order #${o.number}`} back="/admin/orders" sub={when(o.created_at)} />
+      <div className="ad-status-strip"><Pill s={o.status} /><span className="ad-pill">{PAY[o.payment_status]}</span><span className="ad-pill">{METHOD[o.payment_method]}</span>{o.expires_at && <span className="ad-muted">Auto-cancels {when(o.expires_at)}</span>}</div>
+      {actions && <div className="ad-actionbar">{actions}</div>}
+      <div className="ad-detail">
+        <div className="ad-stack">
+          {o.payment_proofs.length > 0 && (
+            <section className="ad-card"><h2>Payment screenshots</h2>
+              <p>Expected: <b>{money(o.total_cents, o.currency)}</b> with reference <b>#{o.number}</b></p>
+              <div className="ad-proofs">{o.payment_proofs.map((p) => (
+                <figure key={p.id} className="ad-proof-card"><ProofImage path={p.file_path} />
+                  <figcaption><span className={`ad-pill ${p.status === 'approved' ? 'ok' : p.status === 'rejected' ? 'bad' : 'info'}`}>{p.status}</span> {when(p.created_at)}{p.transaction_ref && <> · Txn {p.transaction_ref}</>}{p.reject_reason && <><br /><span className="ad-err">{p.reject_reason}</span></>}</figcaption>
+                </figure>
+              ))}</div>
+            </section>
+          )}
+          <section className="ad-card"><h2>Items</h2>
+            <ul className="ad-items">{o.order_items.map((i) => <li key={i.id}><span>{i.name}<small>{i.variant_title} · {money(i.unit_price_cents, o.currency)} × {i.quantity}</small></span><b>{money(i.unit_price_cents * i.quantity, o.currency)}</b></li>)}</ul>
+            <dl className="ad-totals">
+              <div><dt>Subtotal</dt><dd>{money(o.subtotal_cents, o.currency)}</dd></div>
+              {o.discount_cents > 0 && <div><dt>Discount {o.discount_code}</dt><dd>−{money(o.discount_cents, o.currency)}</dd></div>}
+              <div><dt>Shipping</dt><dd>{o.shipping_cents ? money(o.shipping_cents, o.currency) : 'Free'}</dd></div>
+              <div><dt>Tax</dt><dd>{money(o.tax_cents, o.currency)}</dd></div>
+              <div className="ad-total"><dt>Total</dt><dd>{money(o.total_cents, o.currency)}</dd></div>
+            </dl>
+            {o.gift_note && <p className="ad-note">Gift note: “{o.gift_note}”</p>}
           </section>
-          <section className="a-card">
-            <h2>Fulfillment</h2>
-            <ol className="a-steps">{FULFILL.map((s, i) => <li key={s} className={FULFILL.indexOf(o.fulfillment) >= i ? 'done' : ''} aria-current={o.fulfillment === s ? 'step' : undefined}>{s}</li>)}</ol>
-            {!closed && FULFILL.indexOf(o.fulfillment) < FULFILL.length - 1 && (
-              <button className="a-btn primary" onClick={() => { const n = FULFILL[FULFILL.indexOf(o.fulfillment) + 1]; update({ fulfillment: n, notes: [...o.notes, { at: new Date().toISOString(), text: `Marked ${n.toLowerCase()}` }] }, `Order #${o.id} marked ${n.toLowerCase()}`) }}>
-                Mark as {FULFILL[FULFILL.indexOf(o.fulfillment) + 1].toLowerCase()}
-              </button>
-            )}
-          </section>
-          <section className="a-card">
-            <h2>Timeline</h2>
-            <form className="a-row" onSubmit={(e) => { e.preventDefault(); if (!note.trim()) return; update({ notes: [...o.notes, { at: new Date().toISOString(), text: note.trim() }] }, 'Note added'); setNote('') }}>
-              <label className="grow"><span className="sr-only">Add internal note</span><input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Leave an internal note…" /></label>
-              <button className="a-btn">Post</button>
+          <section className="ad-card"><h2>Timeline</h2>
+            <form className="ad-inline" onSubmit={addNote}>
+              <label htmlFor="note" className="sr-only">Internal note</label>
+              <input id="note" name="note" placeholder="Add an internal note…" required maxLength={1000} />
+              <button className="ad-btn">Add</button>
             </form>
-            <ol className="a-timeline">
-              {[...o.notes].reverse().map((n, i) => <li key={i}><time>{new Date(n.at).toLocaleString()}</time><p>{n.text}</p></li>)}
-              <li><time>{new Date(o.date).toLocaleString()}</time><p>Order placed · {o.pay} (demo)</p></li>
-            </ol>
+            <ol className="ad-timeline">{[...o.order_events].sort((x, y) => y.created_at.localeCompare(x.created_at)).map((e) => (
+              <li key={e.id} className={e.type}><time>{when(e.created_at)} · {e.actor_kind}</time><p>{e.type === 'note' ? e.note : <>{e.to_status ? (STATUS[e.to_status]?.[0] || e.to_status) : e.type}{e.note && ` — ${e.note}`}</>}</p></li>
+            ))}</ol>
           </section>
         </div>
-        <aside className="a-stack">
-          <section className="a-card print">
-            <h2>Customer</h2>
-            <p><Link to={`/admin/orders?q=${encodeURIComponent(o.customer.email)}`}>{o.customer.first} {o.customer.last}</Link><br /><a href={`mailto:${o.customer.email}`}>{o.customer.email}</a>{o.customer.phone && <><br />{o.customer.phone}</>}</p>
-            <h3>Shipping address</h3>
-            <address>{o.customer.address}{o.customer.apt && `, ${o.customer.apt}`}<br />{o.customer.city}, {o.customer.state} {o.customer.zip}</address>
-            <p className="a-muted">{o.customer.news ? 'Subscribed to marketing' : 'Not subscribed to marketing'}</p>
+        <aside className="ad-stack">
+          <section className="ad-card"><h2>Customer</h2>
+            <p><b>{a.name}</b><br /><a href={`mailto:${o.email}`}>{o.email}</a>{o.phone && <><br />{o.phone}</>}</p>
+            <div className="ad-row">
+              {o.phone && <a className="ad-btn" href={`tel:${o.phone}`}><Ic.phone /> Call</a>}
+              {phone && <a className="ad-btn" href={`https://wa.me/${phone}?text=${waText}`} target="_blank" rel="noreferrer"><Ic.chat /> WhatsApp</a>}
+              <Link className="ad-btn" to={`/admin/orders?f=all&q=${encodeURIComponent(o.email)}`}>All orders</Link>
+            </div>
+            <h3>Ship to</h3>
+            <address>{a.line1}{a.line2 && <>, {a.line2}</>}<br />{[a.city, a.region, a.postal_code].filter(Boolean).join(', ')}{a.country && <><br />{a.country}</>}</address>
+            {(o.courier || o.tracking_number) && <p><b>Courier:</b> {o.courier} {o.tracking_number && <>· {o.tracking_number}</>}</p>}
+            <p className="ad-muted">{o.whatsapp_opt_in ? 'WhatsApp updates: yes' : 'WhatsApp updates: no'} · {o.marketing_opt_in ? 'Marketing: yes' : 'Marketing: no'}</p>
+            <BlockButtons email={o.email} phone={o.phone} />
+          </section>
+          <section className="ad-card"><h2>Messages sent</h2>
+            {o.notifications.length ? <ul className="ad-list">{o.notifications.map((n) => <li key={n.id}><span>{n.template}<small>{n.channel} · {when(n.created_at)}</small></span><span className={`ad-pill ${n.status === 'sent' ? 'ok' : n.status === 'failed' ? 'bad' : ''}`}>{n.status}</span></li>)}</ul>
+              : <p className="ad-muted">No messages logged yet. Emails are sent automatically once email sending is connected.</p>}
           </section>
         </aside>
       </div>
@@ -291,260 +540,420 @@ function OrderDetail() {
   )
 }
 
-/* ---------- Products ---------- */
-function Products() {
-  const { notify, confirm } = useUI()
-  const navigate = useNavigate()
-  const [q, setQ] = useState('')
-  const [cat, setCat] = useState('')
-  const [sel, setSel] = useState([])
-  const rows = products.filter((p) => (!cat || p.cat.includes(cat)) && p.name.toLowerCase().includes(q.toLowerCase())).map((p) => ({ ...p, stockN: p.stock ?? Infinity }))
-  const [sorted, th] = useSort(rows, 'name')
-  const del = async (slugs) => {
-    if (!(await confirm({ title: `Delete ${slugs.length} product${slugs.length > 1 ? 's' : ''}?`, body: 'This cannot be undone.', ok: 'Delete' }))) return
-    slugs.forEach((s) => products.splice(products.findIndex((p) => p.slug === s), 1))
-    setSel([]); commit(); notify(`Deleted ${slugs.length} product${slugs.length > 1 ? 's' : ''}`)
-  }
-  const setStock = (p, v) => { p.stock = v === '' ? undefined : Math.max(0, +v); commit() }
-  const all = sorted.length > 0 && sel.length === sorted.length
-  return (
-    <>
-      <H actions={<button className="a-btn primary" onClick={() => navigate('/admin/products/new')}>+ Add product</button>}>Products</H>
-      <div className="a-toolbar">
-        <label className="a-search"><span className="sr-only">Search products</span><input type="search" placeholder="Search products" value={q} onChange={(e) => setQ(e.target.value)} /></label>
-        <label>Collection <select value={cat} onChange={(e) => setCat(e.target.value)}><option value="">All</option>{Object.entries(collections).filter(([k]) => k !== 'all').map(([k, v]) => <option key={k} value={k}>{v.title}</option>)}</select></label>
-        {!!sel.length && <div className="a-row" role="group" aria-label="Bulk actions"><span>{sel.length} selected</span><button className="a-btn danger" onClick={() => del(sel)}>Delete selected</button></div>}
-      </div>
-      <p className="sr-only" role="status">{sorted.length} products shown</p>
-      <div className="a-card flush">
-        <table className="a-table">
-          <caption className="sr-only">Products, sortable by column</caption>
-          <thead><tr>
-            <th scope="col" className="chk"><input type="checkbox" aria-label="Select all products" checked={all} onChange={() => setSel(all ? [] : sorted.map((p) => p.slug))} /></th>
-            <th scope="col"><span className="sr-only">Image</span></th>{th('name', 'Product')}{th('price', 'Price', 'num')}{th('stockN', 'Inventory', 'num')}<th scope="col">Collections</th><th scope="col"><span className="sr-only">Actions</span></th>
-          </tr></thead>
-          <tbody>
-            {sorted.map((p) => (
-              <tr key={p.slug}>
-                <td className="chk"><input type="checkbox" aria-label={`Select ${p.name}`} checked={sel.includes(p.slug)} onChange={() => setSel(sel.includes(p.slug) ? sel.filter((s) => s !== p.slug) : [...sel, p.slug])} /></td>
-                <td className="thumb"><Tin p={p} label={null} /></td>
-                <th scope="row"><Link to={`/admin/products/${p.slug}`}>{p.name}</Link>{p.badge && <> <Badge v={p.badge} /></>}</th>
-                <td className="num">{money(p.price)}</td>
-                <td className="num"><label><span className="sr-only">Stock for {p.name} (blank = not tracked)</span><input className={`a-stock ${p.stock === 0 ? 'zero' : p.stock < settings.lowStock ? 'low' : ''}`} type="number" min="0" value={p.stock ?? ''} placeholder="∞" onChange={(e) => setStock(p, e.target.value)} /></label></td>
-                <td>{p.cat.map((c) => collections[c]?.title).filter(Boolean).join(', ')}</td>
-                <td className="a-actions">
-                  <Link className="a-btn sm" to={`/products/${p.slug}`} target="_blank" rel="noreferrer" aria-label={`View ${p.name} in store (opens new tab)`}>View</Link>
-                  <button className="a-btn sm danger" onClick={() => del([p.slug])} aria-label={`Delete ${p.name}`}>Delete</button>
-                </td>
-              </tr>
-            ))}
-            {!sorted.length && <tr><td colSpan={7} className="a-empty">No products match.</td></tr>}
-          </tbody>
-        </table>
-      </div>
-    </>
-  )
+function DispatchBtn({ move, o, primary }) {
+  return <button className={`ad-btn ${primary ? 'primary' : ''}`} onClick={() => move('dispatched', { title: `Dispatch #${o.number}`, ok: 'Mark dispatched', done: 'Marked dispatched',
+    fields: [{ name: 'courier', label: 'Courier', required: true, placeholder: 'e.g. TCS, Leopards, DHL' }, { name: 'tracking', label: 'Tracking number', required: true, autoComplete: 'off' }] })}><Ic.truck /> Dispatch</button>
 }
 
-const slugify = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-
-function ProductForm() {
-  const { slug } = useParams()
-  const isNew = slug === 'new'
-  const existing = products.find((p) => p.slug === slug)
-  const navigate = useNavigate()
-  const { notify } = useUI()
-  const [f, setF] = useState(() => existing ? { ...existing, stock: existing.stock ?? '', cat: [...existing.cat], tin: [...existing.tin] } : { name: '', slug: '', price: '', stock: '', badge: '', cat: ['tinned-fish'], tin: ['#fdcd62', '#73c3f5'], fish: '', origin: '', desc: '', protein: '', omega: '', mercury: '' })
-  const [errors, setErrors] = useState({})
-  if (!isNew && !existing) return <H>Product not found</H>
-  const set = (k) => (e) => setF({ ...f, [k]: e.target.value })
-  const submit = (e) => {
-    e.preventDefault()
-    const s = f.slug || slugify(f.name)
-    const er = {}
-    if (!f.name.trim()) er.name = 'Name is required'
-    if (f.price === '' || +f.price < 0) er.price = 'Enter a price of 0 or more'
-    if (!f.cat.length) er.cat = 'Choose at least one collection'
-    if (products.some((p) => p.slug === s && p !== existing)) er.slug = 'Another product already uses this URL handle'
-    setErrors(er)
-    if (Object.keys(er).length) { setTimeout(() => document.querySelector('.a-err-summary')?.focus()); return }
-    const data = { ...f, slug: s, price: +f.price, stock: f.stock === '' ? undefined : +f.stock, badge: f.badge || undefined, protein: f.protein === '' ? undefined : +f.protein, omega: f.omega === '' ? undefined : +f.omega, fish: f.fish || null }
-    if (existing) Object.assign(existing, data); else products.push(data)
-    commit(); notify(`${data.name} saved`)
-    navigate('/admin/products')
+function BlockButtons({ email, phone }) {
+  const { ask, act } = useAdmin()
+  const block = async (kind, value) => {
+    const v = await ask({ title: `Block this ${kind}?`, body: `${value} won't be able to place new orders.`, ok: 'Block', danger: true, fields: [{ name: 'reason', label: 'Reason (internal)', required: true }] })
+    if (v) act(supabase.from('blocked_contacts').insert({ kind, value: kind === 'email' ? value.toLowerCase() : value, reason: v.reason }), `${value} blocked`)
   }
-  const fld = (k, label, props = {}) => (
-    <div className={`a-field ${props.half ? 'half' : ''}`}>
-      <label htmlFor={`p-${k}`}>{label}{props.req && <span aria-hidden> *</span>}</label>
-      {props.area ? <textarea id={`p-${k}`} value={f[k]} onChange={set(k)} rows={4} /> : <input id={`p-${k}`} value={f[k]} onChange={set(k)} type={props.type || 'text'} min={props.min} step={props.step} required={props.req} aria-invalid={!!errors[k]} aria-describedby={[errors[k] && `pe-${k}`, props.hint && `ph-${k}`].filter(Boolean).join(' ') || undefined} />}
-      {props.hint && <small id={`ph-${k}`} className="a-muted">{props.hint}</small>}
-      {errors[k] && <p id={`pe-${k}`} className="a-err">{errors[k]}</p>}
+  return (
+    <div className="ad-row ad-sm">
+      <button className="ad-link danger" onClick={() => block('email', email)}><Ic.ban /> Block email</button>
+      {phone && <button className="ad-link danger" onClick={() => block('phone', phone)}><Ic.ban /> Block phone</button>}
     </div>
   )
+}
+
+/* ================= payments queue ================= */
+function Payments() {
+  const review = useProofReview()
+  const q = useQuery(() => supabase.from('payment_proofs').select('id, file_path, created_at, order:orders(id, number, total_cents, currency, email, shipping_address, created_at)').eq('status', 'pending').order('created_at'), [])
   return (
     <>
-      <H><Link to="/admin/products" className="a-back" aria-label="Back to products">←</Link> {isNew ? 'Add product' : f.name}</H>
-      <form className="a-grid2 wide" onSubmit={submit} noValidate>
-        <div className="a-stack">
-          {!!Object.keys(errors).length && <div className="a-err-summary" tabIndex={-1} role="alert"><b>Fix these to save:</b><ul>{Object.entries(errors).map(([k, m]) => <li key={k}><a href={k === 'cat' ? '#p-cat' : `#p-${k}`}>{m}</a></li>)}</ul></div>}
-          <section className="a-card a-fields">
-            {fld('name', 'Title', { req: true })}
-            {fld('desc', 'Description', { area: true })}
+      <Head title="Payments to review" sub="Compare each screenshot with the order total and reference." actions={<button className="ad-icon-btn" onClick={q.reload} aria-label="Refresh"><Ic.refresh /></button>} />
+      <State q={q} empty="No payment screenshots waiting. New ones appear here automatically.">
+        <div className="ad-review-grid">
+          {q.data?.map((p) => (
+            <article key={p.id} className="ad-card ad-review">
+              <ProofImage path={p.file_path} />
+              <div className="ad-review-info">
+                <p className="ad-big">{money(p.order.total_cents, p.order.currency)}</p>
+                <p>Reference <b>#{p.order.number}</b> · {p.order.shipping_address?.name}</p>
+                <p className="ad-muted">{p.order.email}<br />Uploaded {when(p.created_at)}</p>
+                <div className="ad-row">
+                  <button className="ad-btn primary" onClick={() => review.approve(p, p.order)}><Ic.check /> Approve</button>
+                  <button className="ad-btn danger" onClick={() => review.reject(p, p.order)}>Reject</button>
+                  <Link className="ad-btn ghost" to={`/admin/orders/${p.order.id}`}>Order</Link>
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      </State>
+    </>
+  )
+}
+
+/* ================= products ================= */
+function Products() {
+  const { act } = useAdmin()
+  const navigate = useNavigate()
+  const [text, setText] = useState('')
+  const q = useQuery(() => supabase.from('products').select('id, slug, name, status, stock, badge, colors, art, species, image_path, variants(price_cents)').order('sort_order'), [])
+  const list = (q.data || []).filter((p) => p.name.toLowerCase().includes(text.toLowerCase()))
+  const saveStock = (p, v) => {
+    const stock = v === '' ? null : Math.max(0, parseInt(v, 10) || 0)
+    if (stock !== p.stock) act(supabase.from('products').update({ stock }).eq('id', p.id), `Stock updated: ${p.name}`)
+  }
+  return (
+    <>
+      <Head title="Products" sub={q.data ? `${q.data.length} products` : null} actions={<button className="ad-btn primary" onClick={() => navigate('/admin/products/new')}><Ic.plus /> Add</button>} />
+      <div className="ad-search"><Ic.search /><label htmlFor="p-q" className="sr-only">Search products</label><input id="p-q" type="search" placeholder="Search products" value={text} onChange={(e) => setText(e.target.value)} /></div>
+      <State q={q} empty="No products yet.">
+        <ul className="ad-prod-grid">
+          {list.map((p) => {
+            const prices = p.variants.map((v) => v.price_cents)
+            return (
+              <li key={p.id} className="ad-card ad-prod">
+                <Link to={`/admin/products/${p.id}`} className="ad-prod-img" aria-label={`Edit ${p.name}`}>
+                  {p.image_path ? <img src={imgUrl(p.image_path)} alt="" loading="lazy" /> : <Tin p={{ slug: p.slug, tin: p.colors?.length ? p.colors : undefined, fish: p.species, art: p.art }} label={null} />}
+                </Link>
+                <div className="ad-prod-info">
+                  <Link to={`/admin/products/${p.id}`} className="ad-prod-name">{p.name}</Link>
+                  <p className="ad-muted">{prices.length ? (Math.min(...prices) === Math.max(...prices) ? money(prices[0]) : `${money(Math.min(...prices))} – ${money(Math.max(...prices))}`) : 'No variants'}{p.status !== 'active' && <> · <span className="ad-pill warn">{p.status}</span></>}</p>
+                  <label className="ad-stock">
+                    <span>Stock</span>
+                    <input type="number" inputMode="numeric" min="0" defaultValue={p.stock ?? ''} placeholder="∞" aria-label={`Stock for ${p.name}, blank means not tracked`}
+                      className={p.stock === 0 ? 'zero' : p.stock != null && p.stock < 15 ? 'low' : ''} onBlur={(e) => saveStock(p, e.target.value)} onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()} />
+                  </label>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      </State>
+    </>
+  )
+}
+
+const slugify = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80)
+
+function ProductEdit() {
+  const { id } = useParams()
+  const isNew = id === 'new'
+  const navigate = useNavigate()
+  const { act, ask, notify } = useAdmin()
+  const q = useQuery(() => Promise.all([
+    isNew ? { data: null } : supabase.from('products').select('*, variants(*), product_collections(collection)').eq('id', id).single(),
+    supabase.from('collections').select('handle, title').order('sort_order'),
+  ]).then(([p, c]) => (p.error || c.error ? { error: p.error || c.error } : { data: { p: p.data, cols: c.data } })), [id])
+  const [variants, setVariants] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const p = q.data?.p
+  useEffect(() => { if (q.data) setVariants((q.data.p?.variants || [{ title: 'Single', units: 1, gift_tin: false, price_cents: 1000 }]).slice().sort((x, y) => x.sort_order - y.sort_order)) }, [q.data])
+  if (!q.data || !variants) return <><Head title={isNew ? 'New product' : 'Product'} back="/admin/products" /><State q={q}>{null}</State></>
+
+  const setV = (i, k, v) => setVariants(variants.map((x, j) => (j === i ? { ...x, [k]: v } : x)))
+  const save = async (e) => {
+    e.preventDefault()
+    const f = new FormData(e.currentTarget)
+    const row = {
+      name: f.get('name').trim(), slug: f.get('slug').trim() || slugify(f.get('name')), description: f.get('description'),
+      status: f.get('status'), badge: f.get('badge').trim() || null, species: f.get('species').trim() || null, origin: f.get('origin').trim() || null,
+      stock: f.get('stock') === '' ? null : Math.max(0, parseInt(f.get('stock'), 10) || 0), colors: [f.get('c1'), f.get('c2')],
+    }
+    if (!variants.length) return notify('Add at least one variant', 'bad')
+    setBusy(true)
+    try {
+      let pid = p?.id
+      if (isNew) {
+        const { data, error } = await supabase.from('products').insert(row).select('id').single()
+        if (error) throw error
+        pid = data.id
+      } else {
+        const { error } = await supabase.from('products').update(row).eq('id', pid)
+        if (error) throw error
+      }
+      const file = f.get('image')
+      if (file && file.size) {
+        if (file.size > 5 * 1024 * 1024) throw new Error('Image must be 5MB or smaller')
+        const path = `${pid}/${Date.now()}-${file.name.replace(/[^\w.-]/g, '_')}`
+        const up = await supabase.storage.from('product-images').upload(path, file, { contentType: file.type })
+        if (up.error) throw up.error
+        await supabase.from('products').update({ image_path: path }).eq('id', pid)
+      }
+      const keep = variants.filter((v) => v.id).map((v) => v.id)
+      const removed = (p?.variants || []).filter((v) => !keep.includes(v.id)).map((v) => v.id)
+      if (removed.length) { const { error } = await supabase.from('variants').delete().in('id', removed); if (error) throw error }
+      for (const [i, v] of variants.entries()) {
+        const vr = { product_id: pid, title: v.title.trim() || 'Single', units: Number(v.units) || 1, gift_tin: !!v.gift_tin, price_cents: Math.round(Number(v.price_cents) || 0), compare_at_cents: v.compare_at_cents ? Math.round(Number(v.compare_at_cents)) : null, sku: v.sku?.trim() || null, sort_order: i }
+        const { error } = v.id ? await supabase.from('variants').update(vr).eq('id', v.id) : await supabase.from('variants').insert(vr)
+        if (error) throw error
+      }
+      const cols = f.getAll('collections')
+      await supabase.from('product_collections').delete().eq('product_id', pid)
+      if (cols.length) { const { error } = await supabase.from('product_collections').insert(cols.map((c) => ({ product_id: pid, collection: c }))); if (error) throw error }
+      notify(`${row.name} saved`)
+      navigate('/admin/products')
+    } catch (err) {
+      notify(errText(err), 'bad')
+    } finally { setBusy(false) }
+  }
+  const archive = async () => {
+    if (await ask({ title: `Archive ${p.name}?`, body: 'It disappears from the store but past orders keep their history.', ok: 'Archive', danger: true }))
+      if (await act(supabase.from('products').update({ status: 'archived' }).eq('id', p.id), 'Product archived')) navigate('/admin/products')
+  }
+  const inCols = new Set((p?.product_collections || []).map((c) => c.collection))
+  return (
+    <>
+      <Head title={isNew ? 'New product' : p.name} back="/admin/products" />
+      <form className="ad-detail" onSubmit={save}>
+        <div className="ad-stack">
+          <section className="ad-card ad-form">
+            <Field name="name" label="Name" required defaultValue={p?.name} maxLength={200} />
+            <Field name="description" label="Description" type="textarea" defaultValue={p?.description} maxLength={5000} />
+            <div className="ad-grid2">
+              <Field name="species" label="Species" defaultValue={p?.species} />
+              <Field name="origin" label="Origin" defaultValue={p?.origin} />
+            </div>
           </section>
-          <section className="a-card a-fields">
-            <h2>Pricing & inventory</h2>
-            {fld('price', 'Price (USD)', { type: 'number', min: 0, step: '0.01', half: true, req: true })}
-            {fld('stock', 'Stock', { type: 'number', min: 0, half: true, hint: 'Leave blank to not track inventory. 0 = sold out (shows "Notify me").' })}
-          </section>
-          <section className="a-card a-fields">
-            <h2>Details</h2>
-            {fld('fish', 'Species', { half: true })}{fld('origin', 'Origin', { half: true })}
-            {fld('protein', 'Protein (g)', { type: 'number', min: 0, half: true })}{fld('omega', 'Omega-3 (g)', { type: 'number', min: 0, step: '0.1', half: true })}
-            {fld('mercury', 'Mercury level', { half: true })}
+          <section className="ad-card">
+            <h2>Variants & prices</h2>
+            <p className="ad-muted">Prices are in cents (1200 = $12.00). “Tins used” is how many come out of stock per sale (a 6-pack uses 6).</p>
+            <div className="ad-variants">
+              {variants.map((v, i) => (
+                <fieldset key={v.id || `new-${i}`} className="ad-variant">
+                  <legend>Variant {i + 1}</legend>
+                  <div className="ad-grid3">
+                    <div className="ad-field"><label htmlFor={`vt${i}`}>Title</label><input id={`vt${i}`} value={v.title} onChange={(e) => setV(i, 'title', e.target.value)} required /></div>
+                    <div className="ad-field"><label htmlFor={`vp${i}`}>Price (cents)</label><input id={`vp${i}`} type="number" inputMode="numeric" min="0" value={v.price_cents} onChange={(e) => setV(i, 'price_cents', e.target.value)} required /></div>
+                    <div className="ad-field"><label htmlFor={`vc${i}`}>Compare-at</label><input id={`vc${i}`} type="number" inputMode="numeric" min="0" value={v.compare_at_cents ?? ''} onChange={(e) => setV(i, 'compare_at_cents', e.target.value)} /></div>
+                    <div className="ad-field"><label htmlFor={`vu${i}`}>Tins used</label><input id={`vu${i}`} type="number" inputMode="numeric" min="1" max="100" value={v.units} onChange={(e) => setV(i, 'units', e.target.value)} required /></div>
+                    <div className="ad-field"><label htmlFor={`vs${i}`}>SKU</label><input id={`vs${i}`} value={v.sku ?? ''} onChange={(e) => setV(i, 'sku', e.target.value)} /></div>
+                    <label className="ad-check"><input type="checkbox" checked={!!v.gift_tin} onChange={(e) => setV(i, 'gift_tin', e.target.checked)} /> Gift tin</label>
+                  </div>
+                  <button type="button" className="ad-link danger" onClick={() => setVariants(variants.filter((_, j) => j !== i))}><Ic.trash /> Remove variant</button>
+                </fieldset>
+              ))}
+            </div>
+            <button type="button" className="ad-btn" onClick={() => setVariants([...variants, { title: '', units: 1, gift_tin: false, price_cents: 0 }])}><Ic.plus /> Add variant</button>
           </section>
         </div>
-        <aside className="a-stack">
-          <section className="a-card a-fields">
-            <h2>Organization</h2>
-            {fld('slug', 'URL handle', { hint: `/products/${f.slug || slugify(f.name) || '…'}` })}
-            {fld('badge', 'Badge', { hint: 'e.g. New, Best Seller, Limited' })}
-            <fieldset id="p-cat" aria-invalid={!!errors.cat} aria-describedby={errors.cat ? 'pe-cat' : undefined}>
-              <legend>Collections</legend>
-              {Object.entries(collections).filter(([k]) => k !== 'all').map(([k, v]) => (
-                <label key={k} className="a-check"><input type="checkbox" checked={f.cat.includes(k)} onChange={() => setF({ ...f, cat: f.cat.includes(k) ? f.cat.filter((c) => c !== k) : [...f.cat, k] })} /> {v.title}</label>
-              ))}
-              {errors.cat && <p id="pe-cat" className="a-err">{errors.cat}</p>}
+        <aside className="ad-stack">
+          <section className="ad-card ad-form">
+            <Field name="status" label="Status" type="select" defaultValue={p?.status || 'draft'} options={[['draft', 'Draft (hidden)'], ['active', 'Active (on sale)'], ['archived', 'Archived']]} />
+            <Field name="stock" label="Stock (tins)" type="number" inputMode="numeric" min="0" defaultValue={p?.stock ?? ''} hint="Blank = not tracked. 0 = sold out." />
+            <Field name="slug" label="URL handle" defaultValue={p?.slug} pattern="[a-z0-9-]{1,80}" hint="Lowercase letters, numbers and dashes." />
+            <Field name="badge" label="Badge" defaultValue={p?.badge} maxLength={40} hint="e.g. New, Best Seller" />
+            <fieldset className="ad-fieldset"><legend>Collections</legend>
+              {q.data.cols.map((c) => <label key={c.handle} className="ad-check"><input type="checkbox" name="collections" value={c.handle} defaultChecked={inCols.has(c.handle)} /> {c.title}</label>)}
             </fieldset>
           </section>
-          <section className="a-card a-fields">
-            <h2>Placeholder art</h2>
-            <div className="a-row"><label>Tin <input type="color" value={f.tin[0]} onChange={(e) => setF({ ...f, tin: [e.target.value, f.tin[1]] })} /></label><label>Background <input type="color" value={f.tin[1]} onChange={(e) => setF({ ...f, tin: [f.tin[0], e.target.value] })} /></label></div>
-            <Tin p={f} label={null} />
+          <section className="ad-card ad-form">
+            <h2>Image</h2>
+            {p?.image_path && <img className="ad-prod-preview" src={imgUrl(p.image_path)} alt="Current product image" />}
+            <Field name="image" label="Upload photo (JPG, PNG or WebP, max 5MB)" type="file" accept="image/jpeg,image/png,image/webp" />
+            <div className="ad-grid2">
+              <Field name="c1" label="Tin colour" type="color" defaultValue={p?.colors?.[0] || '#fdcd62'} />
+              <Field name="c2" label="Background" type="color" defaultValue={p?.colors?.[1] || '#73c3f5'} />
+            </div>
           </section>
-          <button className="a-btn primary full">Save product</button>
+          <div className="ad-save-bar">
+            <button className="ad-btn primary full" disabled={busy}>{busy ? 'Saving…' : 'Save product'}</button>
+            {!isNew && p.status !== 'archived' && <button type="button" className="ad-btn danger full" onClick={archive}>Archive</button>}
+          </div>
         </aside>
       </form>
     </>
   )
 }
 
-/* ---------- Customers ---------- */
+/* ================= customers ================= */
 function Customers() {
-  const [q, setQ] = useState('')
-  const map = {}
-  orders.forEach((o) => {
-    const k = o.customer.email.toLowerCase()
-    const c = (map[k] ||= { email: o.customer.email, name: `${o.customer.first} ${o.customer.last}`, city: `${o.customer.city}, ${o.customer.state}`, orders: 0, spent: 0, last: o.date, news: o.customer.news })
-    c.orders++
-    if (!['Refunded', 'Cancelled'].includes(o.status)) c.spent += o.total
-    if (o.date > c.last) c.last = o.date
-  })
-  const rows = Object.values(map).filter((c) => `${c.name} ${c.email}`.toLowerCase().includes(q.toLowerCase()))
-  const [sorted, th] = useSort(rows, 'spent', 'desc')
+  const [text, setText] = useState('')
+  const q = useQuery(() => supabase.rpc('admin_customers'), [])
+  const list = (q.data || []).filter((c) => `${c.name} ${c.email} ${c.phone}`.toLowerCase().includes(text.toLowerCase()))
   return (
     <>
-      <H actions={<button className="a-btn" disabled={!rows.length} onClick={() => exportCSV(rows, 'customers.csv')}>Export CSV</button>}>Customers</H>
-      <div className="a-toolbar"><label className="a-search"><span className="sr-only">Search customers</span><input type="search" placeholder="Search customers" value={q} onChange={(e) => setQ(e.target.value)} /></label></div>
-      <div className="a-card flush">
-        <table className="a-table">
-          <caption className="sr-only">Customers, sortable by column</caption>
-          <thead><tr>{th('name', 'Customer')}{th('city', 'Location')}{th('orders', 'Orders', 'num')}{th('spent', 'Amount spent', 'num')}{th('last', 'Last order')}<th scope="col">Marketing</th></tr></thead>
-          <tbody>
-            {sorted.map((c) => <tr key={c.email}><th scope="row"><Link to={`/admin/orders?q=${encodeURIComponent(c.email)}`}>{c.name}</Link><br /><small className="a-muted">{c.email}</small></th><td>{c.city}</td><td className="num">{c.orders}</td><td className="num">{money(c.spent)}</td><td>{fmtDate(c.last)}</td><td><Badge v={c.news ? 'Subscribed' : 'No'} /></td></tr>)}
-            {!sorted.length && <tr><td colSpan={6} className="a-empty">No customers yet. They appear after the first order.</td></tr>}
-          </tbody>
-        </table>
-      </div>
+      <Head title="Customers" sub={q.data ? `${q.data.length} customers` : null} actions={<button className="ad-btn" disabled={!q.data?.length} onClick={() => csv(q.data, 'customers.csv')}>Export CSV</button>} />
+      <div className="ad-search"><Ic.search /><label htmlFor="c-q" className="sr-only">Search customers</label><input id="c-q" type="search" placeholder="Name, email or phone" value={text} onChange={(e) => setText(e.target.value)} /></div>
+      <State q={q} empty="Customers appear after their first order.">
+        <ul className="ad-rows">{list.map((c) => (
+          <li key={c.email} className="ad-card ad-cust">
+            <div><b>{c.name || c.email}</b><small>{c.email}{c.phone && ` · ${c.phone}`}</small></div>
+            <div className="ad-cust-stats">
+              <span>{c.orders} orders</span><b>{money(c.spent_cents)}</b>
+              {c.cod_cancelled > 0 && <span className="ad-pill bad" title="Cancelled cash-on-delivery orders">{c.cod_cancelled} COD cancelled</span>}
+              {c.marketing && <span className="ad-pill ok">Subscribed</span>}
+            </div>
+            <div className="ad-row ad-sm"><Link className="ad-link" to={`/admin/orders?f=all&q=${encodeURIComponent(c.email)}`}>View orders</Link><BlockButtons email={c.email} phone={c.phone} /></div>
+          </li>
+        ))}</ul>
+      </State>
     </>
   )
 }
 
-/* ---------- Discounts ---------- */
+/* ================= discounts ================= */
 function Discounts() {
-  const { notify, confirm } = useUI()
-  const [f, setF] = useState({ code: '', type: 'pct', pct: 10, label: '' })
-  const [err, setErr] = useState('')
-  const add = (e) => {
-    e.preventDefault()
-    const k = f.code.trim().toUpperCase()
-    if (!/^[A-Z0-9_-]{3,20}$/.test(k)) return setErr('Use 3–20 letters, numbers, - or _')
-    if (codes[k]) return setErr('That code already exists')
-    if (f.type === 'pct' && !(f.pct > 0 && f.pct <= 100)) return setErr('Percent must be 1–100')
-    codes[k] = f.type === 'pct' ? { pct: +f.pct, label: f.label || `${f.pct}% off`, active: true, uses: 0 } : { ship: true, label: f.label || 'Free shipping', active: true, uses: 0 }
-    commit(); notify(`Code ${k} created`); setErr(''); setF({ code: '', type: 'pct', pct: 10, label: '' })
+  const { act, ask } = useAdmin()
+  const q = useQuery(() => supabase.from('discount_codes').select('*').order('created_at', { ascending: false }), [])
+  const create = async () => {
+    const v = await ask({ title: 'New discount code', ok: 'Create', fields: [
+      { name: 'code', label: 'Code', required: true, pattern: '[A-Za-z0-9_-]{3,32}', hint: '3–32 letters, numbers, - or _', style: { textTransform: 'uppercase' } },
+      { name: 'type', label: 'Type', type: 'select', options: [['percent', 'Percent off'], ['fixed', 'Fixed amount off (cents)'], ['free_shipping', 'Free shipping']] },
+      { name: 'value', label: 'Value', type: 'number', min: 0, defaultValue: 10, hint: 'Percent: 1–100. Fixed: amount in cents.' },
+      { name: 'label', label: 'Label shown to customers' },
+      { name: 'max_uses', label: 'Max uses (optional)', type: 'number', min: 1 },
+      { name: 'min', label: 'Minimum order in cents (optional)', type: 'number', min: 0 },
+      { name: 'ends_at', label: 'Ends on (optional)', type: 'date' },
+    ] })
+    if (!v) return
+    act(supabase.from('discount_codes').insert({
+      code: v.code.toUpperCase().trim(), type: v.type, value: v.type === 'free_shipping' ? 0 : Number(v.value) || 0, label: v.label,
+      max_uses: v.max_uses ? Number(v.max_uses) : null, min_subtotal_cents: v.min ? Number(v.min) : 0, ends_at: v.ends_at ? `${v.ends_at}T23:59:59` : null,
+    }), `Code ${v.code.toUpperCase()} created`)
+  }
+  const describe = (d) => (d.type === 'percent' ? `${d.value}% off` : d.type === 'fixed' ? `${money(d.value)} off` : 'Free shipping')
+  return (
+    <>
+      <Head title="Discounts" actions={<button className="ad-btn primary" onClick={create}><Ic.plus /> New code</button>} />
+      <State q={q} empty="No discount codes yet.">
+        <ul className="ad-rows">{q.data?.map((d) => (
+          <li key={d.code} className="ad-card ad-code">
+            <div><code>{d.code}</code><small>{describe(d)}{d.min_subtotal_cents > 0 && ` · min ${money(d.min_subtotal_cents)}`}{d.ends_at && ` · ends ${new Date(d.ends_at).toLocaleDateString()}`}</small></div>
+            <span className="ad-muted">{d.uses}{d.max_uses ? `/${d.max_uses}` : ''} used</span>
+            <label className="ad-switch"><input type="checkbox" role="switch" checked={d.active} onChange={() => act(supabase.from('discount_codes').update({ active: !d.active }).eq('code', d.code), `${d.code} ${d.active ? 'paused' : 'activated'}`)} /><span>{d.active ? 'Active' : 'Paused'}</span></label>
+            <button className="ad-icon-btn danger" aria-label={`Delete ${d.code}`} onClick={async () => { if (await ask({ title: `Delete ${d.code}?`, ok: 'Delete', danger: true })) act(supabase.from('discount_codes').delete().eq('code', d.code), `${d.code} deleted`) }}><Ic.trash /></button>
+          </li>
+        ))}</ul>
+      </State>
+    </>
+  )
+}
+
+/* ================= reviews ================= */
+function Reviews() {
+  const { act } = useAdmin()
+  const [f, setF] = useState('pending')
+  const q = useQuery(() => supabase.from('reviews').select('*, product:products(name)').eq('status', f).order('created_at', { ascending: false }), [f])
+  return (
+    <>
+      <Head title="Reviews" />
+      <div className="ad-chips" role="group" aria-label="Filter reviews">{['pending', 'approved', 'rejected'].map((s) => <button key={s} aria-pressed={f === s} onClick={() => setF(s)}>{s[0].toUpperCase() + s.slice(1)}</button>)}</div>
+      <State q={q} empty={`No ${f} reviews.`}>
+        <ul className="ad-rows">{q.data?.map((r) => (
+          <li key={r.id} className="ad-card ad-review-item">
+            <p><b>{r.product?.name}</b> <span aria-label={`${r.rating} out of 5`}>{'★'.repeat(r.rating)}{'☆'.repeat(5 - r.rating)}</span></p>
+            {r.title && <h3>{r.title}</h3>}
+            <p>{r.body}</p>
+            <small className="ad-muted">{when(r.created_at)} · verified buyer</small>
+            <div className="ad-row">
+              {r.status !== 'approved' && <button className="ad-btn primary" onClick={() => act(supabase.from('reviews').update({ status: 'approved' }).eq('id', r.id), 'Review published')}>Publish</button>}
+              {r.status !== 'rejected' && <button className="ad-btn" onClick={() => act(supabase.from('reviews').update({ status: 'rejected' }).eq('id', r.id), 'Review hidden')}>Hide</button>}
+              <button className="ad-btn danger" onClick={() => act(supabase.from('reviews').delete().eq('id', r.id), 'Review deleted')}>Delete</button>
+            </div>
+          </li>
+        ))}</ul>
+      </State>
+    </>
+  )
+}
+
+/* ================= blocklist ================= */
+function Blocklist() {
+  const { act, ask } = useAdmin()
+  const q = useQuery(() => supabase.from('blocked_contacts').select('*').order('created_at', { ascending: false }), [])
+  const add = async () => {
+    const v = await ask({ title: 'Block a contact', ok: 'Block', danger: true, fields: [
+      { name: 'kind', label: 'Type', type: 'select', options: [['phone', 'Phone (+92…)'], ['email', 'Email'], ['ip', 'IP address']] },
+      { name: 'value', label: 'Value', required: true },
+      { name: 'reason', label: 'Reason', required: true },
+    ] })
+    if (v) act(supabase.from('blocked_contacts').insert({ kind: v.kind, value: v.kind === 'email' ? v.value.trim().toLowerCase() : v.value.trim(), reason: v.reason }), `${v.value} blocked`)
   }
   return (
     <>
-      <H>Discounts</H>
-      <div className="a-grid2 wide">
-        <div className="a-card flush">
-          <table className="a-table">
-            <caption className="sr-only">Discount codes</caption>
-            <thead><tr><th scope="col">Code</th><th scope="col">Discount</th><th scope="col" className="num">Uses</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
-            <tbody>
-              {Object.entries(codes).map(([k, c]) => (
-                <tr key={k}>
-                  <th scope="row"><code>{k}</code></th><td>{c.label}</td><td className="num">{c.uses || 0}</td>
-                  <td><label className="a-switch"><input type="checkbox" role="switch" checked={c.active} onChange={() => { c.active = !c.active; commit(); notify(`${k} ${c.active ? 'activated' : 'deactivated'}`) }} /><span>{c.active ? 'Active' : 'Inactive'}</span></label></td>
-                  <td><button className="a-btn sm danger" aria-label={`Delete code ${k}`} onClick={async () => { if (await confirm({ title: `Delete ${k}?`, body: 'Customers will no longer be able to use it.', ok: 'Delete' })) { delete codes[k]; commit(); notify(`${k} deleted`) } }}>Delete</button></td>
-                </tr>
-              ))}
-              {!Object.keys(codes).length && <tr><td colSpan={5} className="a-empty">No discount codes.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-        <form className="a-card a-fields" onSubmit={add} noValidate>
-          <h2>Create code</h2>
-          <div className="a-field"><label htmlFor="d-code">Code *</label><input id="d-code" value={f.code} onChange={(e) => setF({ ...f, code: e.target.value })} aria-invalid={!!err} aria-describedby={err ? 'd-err' : undefined} style={{ textTransform: 'uppercase' }} /></div>
-          <fieldset><legend>Type</legend>
-            <label className="a-check"><input type="radio" name="dtype" checked={f.type === 'pct'} onChange={() => setF({ ...f, type: 'pct' })} /> Percentage off</label>
-            <label className="a-check"><input type="radio" name="dtype" checked={f.type === 'ship'} onChange={() => setF({ ...f, type: 'ship' })} /> Free shipping</label>
-          </fieldset>
-          {f.type === 'pct' && <div className="a-field"><label htmlFor="d-pct">Percent off</label><input id="d-pct" type="number" min="1" max="100" value={f.pct} onChange={(e) => setF({ ...f, pct: e.target.value })} /></div>}
-          <div className="a-field"><label htmlFor="d-label">Customer-facing label</label><input id="d-label" value={f.label} onChange={(e) => setF({ ...f, label: e.target.value })} /></div>
-          {err && <p id="d-err" className="a-err" role="alert">{err}</p>}
-          <button className="a-btn primary">Create code</button>
-        </form>
-      </div>
+      <Head title="Blocklist" sub="Blocked phones, emails and IPs can't place orders." actions={<button className="ad-btn primary" onClick={add}><Ic.plus /> Block</button>} />
+      <State q={q} empty="Nobody is blocked.">
+        <ul className="ad-rows">{q.data?.map((b) => (
+          <li key={`${b.kind}:${b.value}`} className="ad-card ad-code">
+            <div><b>{b.value}</b><small>{b.kind} · {b.reason} · {when(b.created_at)}</small></div>
+            <button className="ad-btn" onClick={() => act(supabase.from('blocked_contacts').delete().eq('kind', b.kind).eq('value', b.value), `${b.value} unblocked`)}>Unblock</button>
+          </li>
+        ))}</ul>
+      </State>
     </>
   )
 }
 
-/* ---------- Settings ---------- */
+/* ================= subscribers ================= */
+function Subscribers() {
+  const q = useQuery(() => supabase.from('subscribers').select('*').order('created_at', { ascending: false }), [])
+  return (
+    <>
+      <Head title="Subscribers" sub={q.data ? `${q.data.length} emails` : null} actions={<button className="ad-btn" disabled={!q.data?.length} onClick={() => csv(q.data, 'subscribers.csv')}>Export CSV</button>} />
+      <State q={q} empty="No newsletter signups yet.">
+        <ul className="ad-card ad-list">{q.data?.map((s) => <li key={s.email}><span>{s.email}</span><small className="ad-muted">{when(s.created_at)}</small></li>)}</ul>
+      </State>
+    </>
+  )
+}
+
+/* ================= settings ================= */
 function Settings() {
-  const { notify, confirm } = useUI()
-  const [f, setF] = useState({ ...settings, subOff: settings.subOff * 100, taxRate: settings.taxRate * 100, announcements: settings.announcements.join('\n') })
-  const [pass, setPass] = useState('')
-  const set = (k) => (e) => setF({ ...f, [k]: e.target.value })
+  const { act } = useAdmin()
+  const q = useQuery(() => supabase.rpc('admin_settings'), [])
+  const s = q.data
   const save = (e) => {
     e.preventDefault()
-    Object.assign(settings, { freeShip: +f.freeShip, giftTin: +f.giftTin, subOff: +f.subOff / 100, taxRate: +f.taxRate / 100, lowStock: +f.lowStock, announcements: f.announcements.split('\n').map((s) => s.trim()).filter(Boolean) })
-    if (pass) { if (pass.length < 6) return notify('Passcode must be at least 6 characters'); settings.adminPass = pass; setPass('') }
-    commit(); notify('Settings saved')
+    const f = Object.fromEntries(new FormData(e.currentTarget))
+    const cents = (v) => Math.round(Number(v || 0) * 100)
+    act(supabase.from('settings').update({
+      currency: f.currency.trim().toUpperCase() || 'USD',
+      free_ship_threshold_cents: cents(f.free_ship), shipping_flat_cents: cents(f.flat_ship),
+      tax_rate: Number(f.tax || 0) / 100, low_stock_threshold: Number(f.low || 0),
+      bank_transfer_enabled: !!f.bank_on, cod_enabled: !!f.cod_on, cod_max_total_cents: f.cod_max ? cents(f.cod_max) : null,
+      unpaid_expiry_hours: Number(f.unpaid_h) || 48, cod_confirm_expiry_hours: Number(f.cod_h) || 24,
+      announcements: f.announcements.split('\n').map((x) => x.trim()).filter(Boolean),
+      bank_details: { bank: f.bank, account_title: f.account_title, account_number: f.account_number, iban: f.iban, instructions: f.instructions },
+    }).eq('id', true), 'Settings saved')
   }
-  const num = (k, label, hint, step = '1') => <div className="a-field half"><label htmlFor={`s-${k}`}>{label}</label><input id={`s-${k}`} type="number" min="0" step={step} value={f[k]} onChange={set(k)} aria-describedby={`sh-${k}`} /><small id={`sh-${k}`} className="a-muted">{hint}</small></div>
   return (
     <>
-      <H>Settings</H>
-      <form className="a-stack narrow" onSubmit={save}>
-        <section className="a-card a-fields">
-          <h2>Checkout & pricing</h2>
-          {num('freeShip', 'Free shipping threshold ($)', 'Drives the cart progress bar.')}
-          {num('taxRate', 'Tax rate (%)', 'Flat estimated rate.', '0.01')}
-          {num('subOff', 'Subscribe & Save discount (%)', 'Applied to subscription purchases.')}
-          {num('giftTin', 'Gift tin upcharge ($)', 'Added for the gift tin option.', '0.01')}
-          {num('lowStock', 'Low stock threshold', 'Below this, products show "Only X left".')}
-        </section>
-        <section className="a-card a-fields">
-          <h2>Announcement bar</h2>
-          <div className="a-field"><label htmlFor="s-ann">Messages (one per line)</label><textarea id="s-ann" rows={5} value={f.announcements} onChange={set('announcements')} /></div>
-        </section>
-        <section className="a-card a-fields">
-          <h2>Security</h2>
-          <div className="a-field"><label htmlFor="s-pass">New admin passcode</label><input id="s-pass" type="password" autoComplete="new-password" value={pass} onChange={(e) => setPass(e.target.value)} aria-describedby="s-pass-h" /><small id="s-pass-h" className="a-muted">Leave blank to keep current. Min 6 characters. Demo only, so use server-side auth in production.</small></div>
-        </section>
-        <div className="a-row"><button className="a-btn primary">Save settings</button><button type="button" className="a-btn danger" onClick={async () => { if (await confirm({ title: 'Reset all store data?', body: 'Products, orders, discount codes and settings return to the demo defaults.', ok: 'Reset' })) resetStore() }}>Reset demo data</button></div>
-      </form>
+      <Head title="Settings" />
+      <State q={q}>
+        {s && (
+          <form className="ad-stack ad-narrow" onSubmit={save}>
+            <section className="ad-card ad-form"><h2>Payments</h2>
+              <Field name="bank_on" label="Accept bank transfer" type="checkbox" defaultValue={s.bank_transfer_enabled} />
+              <div className="ad-grid2">
+                <Field name="bank" label="Bank name" defaultValue={s.bank_details?.bank} />
+                <Field name="account_title" label="Account title" defaultValue={s.bank_details?.account_title} />
+                <Field name="account_number" label="Account number" defaultValue={s.bank_details?.account_number} inputMode="numeric" />
+                <Field name="iban" label="IBAN" defaultValue={s.bank_details?.iban} />
+              </div>
+              <Field name="instructions" label="Instructions shown to customers" type="textarea" defaultValue={s.bank_details?.instructions} />
+              <Field name="cod_on" label="Accept cash on delivery" type="checkbox" defaultValue={s.cod_enabled} />
+              <Field name="cod_max" label="COD limit per order (blank = no limit)" type="number" min="0" step="0.01" defaultValue={s.cod_max_total_cents != null ? s.cod_max_total_cents / 100 : ''} />
+            </section>
+            <section className="ad-card ad-form"><h2>Order windows</h2>
+              <div className="ad-grid2">
+                <Field name="unpaid_h" label="Cancel unpaid transfers after (hours)" type="number" min="1" defaultValue={s.unpaid_expiry_hours} />
+                <Field name="cod_h" label="Cancel unconfirmed COD after (hours)" type="number" min="1" defaultValue={s.cod_confirm_expiry_hours} />
+              </div>
+            </section>
+            <section className="ad-card ad-form"><h2>Pricing</h2>
+              <div className="ad-grid2">
+                <Field name="currency" label="Currency code" defaultValue={s.currency} maxLength={3} hint="e.g. USD, PKR" />
+                <Field name="tax" label="Tax rate (%)" type="number" min="0" max="100" step="0.01" defaultValue={Number(s.tax_rate) * 100} />
+                <Field name="free_ship" label="Free shipping from" type="number" min="0" step="0.01" defaultValue={s.free_ship_threshold_cents / 100} />
+                <Field name="flat_ship" label="Flat shipping" type="number" min="0" step="0.01" defaultValue={s.shipping_flat_cents / 100} />
+                <Field name="low" label="Low-stock warning below" type="number" min="0" defaultValue={s.low_stock_threshold} />
+              </div>
+            </section>
+            <section className="ad-card ad-form"><h2>Announcement bar</h2>
+              <Field name="announcements" label="One message per line" type="textarea" rows={4} defaultValue={(s.announcements || []).join('\n')} />
+            </section>
+            <div className="ad-save-bar"><button className="ad-btn primary full">Save settings</button></div>
+          </form>
+        )}
+      </State>
     </>
   )
 }

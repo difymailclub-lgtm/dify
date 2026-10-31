@@ -1,9 +1,9 @@
-import { useSyncExternalStore } from 'react'
+import { useSyncExternalStore, lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { subscribe, getVersion } from './data'
 import { CartProvider, Layout } from './components'
 import { CartPage, Checkout, ThankYou } from './checkout'
-import { Admin } from './admin'
+const Admin = lazy(() => import('./admin').then((m) => ({ default: m.Admin }))) // shoppers never download admin code
 import { Home, Collection, Product, Bundles, Story, Recipes, Recipe, StoreLocator, FAQ, Info, NotFound } from './pages'
 
 export default function App() {
@@ -26,7 +26,7 @@ export default function App() {
             <Route path="/cart" element={<CartPage />} />
             <Route path="/checkout" element={<Checkout />} />
             <Route path="/checkout/thank-you/:id" element={<ThankYou />} />
-            <Route path="/admin/*" element={<Admin />} />
+            <Route path="/admin/*" element={<Suspense fallback={<p className="ad-center">Loading admin…</p>}><Admin /></Suspense>} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </Layout>
