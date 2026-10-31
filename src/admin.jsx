@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react'
 import { Link, NavLink, Routes, Route, useNavigate, useParams, useLocation, useSearchParams } from 'react-router-dom'
-import { supabase, errText } from './lib/supabase'
+import { supabase, errText, authLinkType } from './lib/supabase'
 import { Tin } from './components'
 import { UI } from './art'
 import './admin.css'
@@ -78,11 +78,12 @@ export function Admin() {
   const [version, setVersion] = useState(0)
   const [counts, setCounts] = useState({})
   const [sheet, setSheet] = useState(false)
+  const [needsPassword, setNeedsPassword] = useState(authLinkType === 'invite' || authLinkType === 'recovery')
   const loc = useLocation()
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session))
-    const { data } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
+    const { data } = supabase.auth.onAuthStateChange((e, s) => { setSession(s); if (e === 'PASSWORD_RECOVERY') setNeedsPassword(true) })
     return () => data.subscription.unsubscribe()
   }, [])
   useEffect(() => {
@@ -131,6 +132,7 @@ export function Admin() {
 
   if (session === undefined) return <div className="admin" {...attrs}><p className="ad-center" role="status">Loading…</p></div>
   if (!session) return <div className="admin" {...attrs}><Login /></div>
+  if (needsPassword) return <div className="admin" {...attrs}><SetPassword email={session.user.email} done={() => setNeedsPassword(false)} /></div>
   if (isAdmin === null) return <div className="admin" {...attrs}><p className="ad-center" role="status">Checking access…</p></div>
   if (!isAdmin) return (
     <div className="admin" {...attrs}>
@@ -287,6 +289,35 @@ function Login() {
         <button className="ad-btn primary full" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
         <button type="button" className="ad-link" onClick={reset}>Forgot password?</button>
         <Link to="/">← Back to store</Link>
+      </form>
+    </main>
+  )
+}
+
+// Invite and password-reset links sign the user in; they must choose a password before continuing.
+function SetPassword({ email, done }) {
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const submit = async (e) => {
+    e.preventDefault()
+    const { password, confirm } = Object.fromEntries(new FormData(e.currentTarget))
+    if (password.length < 10 || !/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/\d/.test(password)) return setErr('Use at least 10 characters with a lowercase letter, an uppercase letter and a number.')
+    if (password !== confirm) return setErr('The two passwords don’t match.')
+    setBusy(true); setErr('')
+    const { error } = await supabase.auth.updateUser({ password })
+    setBusy(false)
+    if (error) setErr(error.message); else done()
+  }
+  return (
+    <main className="ad-login">
+      <form className="ad-login-card" onSubmit={submit} aria-describedby="pw-rules">
+        <h1>Choose a password</h1>
+        <p className="ad-muted">Signed in as <b>{email}</b></p>
+        <Field name="password" label="New password" type="password" autoComplete="new-password" required minLength={10} autoFocus />
+        <Field name="confirm" label="Repeat password" type="password" autoComplete="new-password" required minLength={10} />
+        <small id="pw-rules" className="ad-muted">At least 10 characters, with a lowercase letter, an uppercase letter and a number.</small>
+        {err && <p className="ad-err" role="alert">{err}</p>}
+        <button className="ad-btn primary full" disabled={busy}>{busy ? 'Saving…' : 'Save password'}</button>
       </form>
     </main>
   )
